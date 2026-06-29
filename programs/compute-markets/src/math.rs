@@ -181,6 +181,23 @@ pub fn fee_amount(amount: u64, fee_bps: u16) -> Option<u64> {
     u64::try_from(f).ok()
 }
 
+/// Oracle comparison: YES iff the feed value is `>=` the strike.
+pub const CMP_GTE: u8 = 0;
+/// Oracle comparison: YES iff the feed value is `<=` the strike.
+pub const CMP_LTE: u8 = 1;
+
+/// Map an oracle `value` and `strike` to a binary outcome under `comparison`.
+/// Returns `Some(true)` for a YES resolution, `Some(false)` for NO, and `None`
+/// for an unknown comparison code. Both `value` and `strike` are in the feed's
+/// native fixed-point integer scale (so the comparison is exact integer math).
+pub fn oracle_is_yes(value: i64, strike: i64, comparison: u8) -> Option<bool> {
+    match comparison {
+        CMP_GTE => Some(value >= strike),
+        CMP_LTE => Some(value <= strike),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +285,22 @@ mod tests {
             p0,
             p1
         );
+    }
+
+    #[test]
+    fn oracle_decision() {
+        // value >= strike => YES
+        assert_eq!(oracle_is_yes(250, 220, CMP_GTE), Some(true));
+        assert_eq!(oracle_is_yes(220, 220, CMP_GTE), Some(true)); // boundary inclusive
+        assert_eq!(oracle_is_yes(219, 220, CMP_GTE), Some(false));
+        // value <= strike => YES
+        assert_eq!(oracle_is_yes(150, 220, CMP_LTE), Some(true));
+        assert_eq!(oracle_is_yes(220, 220, CMP_LTE), Some(true));
+        assert_eq!(oracle_is_yes(221, 220, CMP_LTE), Some(false));
+        // negative values compare correctly
+        assert_eq!(oracle_is_yes(-5, -10, CMP_GTE), Some(true));
+        // unknown comparison rejected
+        assert_eq!(oracle_is_yes(1, 1, 7), None);
     }
 
     #[test]

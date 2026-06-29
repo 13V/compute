@@ -17,8 +17,13 @@ export const STATE_RESOLVING = 1;
 export const STATE_RESOLVED = 2;
 export const STATE_VOID = 3;
 
-/** Resolver kinds (only TRUSTED_KEY is wired today; others reserved). */
+/** Resolver kinds. */
 export const RESOLVER_TRUSTED_KEY = 0;
+export const RESOLVER_ORACLE_FEED = 1;
+
+/** Oracle comparison codes: YES iff value >= strike (GTE) / value <= strike (LTE). */
+export const CMP_GTE = 0;
+export const CMP_LTE = 1;
 
 export const VOID_REASON_DISPUTE = 0;
 export const VOID_REASON_STALE = 1;

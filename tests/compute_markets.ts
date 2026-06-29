@@ -36,6 +36,9 @@ import {
   OUTCOME_NO,
   STATE_RESOLVED,
   STATE_VOID,
+  STATE_RESOLVING,
+  RESOLVER_ORACLE_FEED,
+  CMP_GTE,
   quoteBuy,
   quoteSell,
   feeAmount,
@@ -386,6 +389,114 @@ describe("compute-markets", () => {
         usdcMint
       );
       assert.match(await sendExpectFail([bad.ix], admin), /InvalidTimeWindow/);
+    });
+  });
+
+  describe("oracle-feed resolution (Switchboard bridge)", () => {
+    // Create + seed an oracle-resolved market bound to `feed`, strike, comparison.
+    async function createOracleMarket(opts: {
+      feed: PublicKey;
+      strike: number;
+      comparison: number;
+      maxStaleness: number;
+      resolutionOffset?: number;
+    }): Promise<number> {
+      const off = opts.resolutionOffset ?? 6;
+      const now = nowSec();
+      const { ix, marketId } = await client.createMarketIx(
+        admin.publicKey,
+        {
+          question: `H100 neocloud >= $${opts.strike / 100}/hr?`,
+          resolutionSource: "OCPI ORNNH100",
+          closeTime: new BN(now + off),
+          resolutionTime: new BN(now + off),
+          resolver: admin.publicKey,
+          resolverKind: RESOLVER_ORACLE_FEED,
+          oracleFeed: opts.feed,
+          oracleStrike: new BN(opts.strike),
+          oracleComparison: opts.comparison,
+          oracleMaxStaleness: new BN(opts.maxStaleness),
+        },
+        usdcMint
+      );
+      await send([ix], admin);
+      await send([await client.seedLiquidityIx(admin.publicKey, marketId, USDC(1000), usdcMint)], admin);
+      return marketId;
+    }
+
+    // Init a fresh feed (signed by the feed keypair) and publish an initial value.
+    async function makeFeed(value: number): Promise<Keypair> {
+      const feed = Keypair.generate();
+      await send([await client.initPriceFeedIx(admin.publicKey, feed.publicKey, "OCPI ORNNH100", 2)], admin, [feed]);
+      await send([await client.publishPriceIx(admin.publicKey, feed.publicKey, new BN(value))], admin);
+      return feed;
+    }
+
+    it("resolves YES from the feed when value >= strike; finalizes after dispute", async () => {
+      const feed = await makeFeed(252); // $2.52
+      const marketId = await createOracleMarket({ feed: feed.publicKey, strike: 220, comparison: CMP_GTE, maxStaleness: 3600 });
+      await buy(user1, marketId, OUTCOME_YES, USDC(100));
+
+      // Trusted-key proposal must be rejected on an oracle market.
+      assert.match(
+        await sendExpectFail([await client.proposeOutcomeIx(admin.publicKey, marketId, OUTCOME_YES)], admin),
+        /WrongResolverKind/
+      );
+
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+
+      // Anyone can crank oracle resolution.
+      await send([await client.proposeFromOracleIx(user2.publicKey, marketId, feed.publicKey)], user2);
+      const proposing = await client.fetchMarketById(marketId);
+      assert.strictEqual(proposing.state, STATE_RESOLVING);
+      assert.strictEqual(proposing.proposedOutcome, OUTCOME_YES, "252 >= 220 => YES");
+
+      // Guardian could still veto here (defense in depth) — we let it finalize.
+      await waitChainTime(proposing.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeOutcomeIx(user2.publicKey, marketId)], user2);
+      const fin = await client.fetchMarketById(marketId);
+      assert.strictEqual(fin.state, STATE_RESOLVED);
+      assert.strictEqual(fin.outcome, OUTCOME_YES);
+
+      // Winner redeems.
+      const yesAta = getAssociatedTokenAddressSync(deriveMarketAccounts(marketId).yesMint, user1.publicKey);
+      const bal = await tokenBalance(yesAta);
+      await send([await client.redeemIx(user1.publicKey, marketId, OUTCOME_YES, bal, usdcMint)], user1);
+      await assertConservation(marketId, "oracle-redeem");
+    });
+
+    it("resolves NO when value < strike", async () => {
+      const feed = await makeFeed(180); // $1.80 < $2.20
+      const marketId = await createOracleMarket({ feed: feed.publicKey, strike: 220, comparison: CMP_GTE, maxStaleness: 3600 });
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+      await send([await client.proposeFromOracleIx(user1.publicKey, marketId, feed.publicKey)], user1);
+      assert.strictEqual((await client.fetchMarketById(marketId)).proposedOutcome, OUTCOME_NO, "180 < 220 => NO");
+    });
+
+    it("rejects oracle resolution on a stale feed", async () => {
+      const feed = await makeFeed(252);
+      // maxStaleness = 2s, but resolution_time is ~6s out, so the value is stale by then.
+      const marketId = await createOracleMarket({ feed: feed.publicKey, strike: 220, comparison: CMP_GTE, maxStaleness: 2 });
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+      assert.match(
+        await sendExpectFail([await client.proposeFromOracleIx(user1.publicKey, marketId, feed.publicKey)], user1),
+        /StaleFeed/
+      );
+      // Re-publishing a fresh value lets it resolve.
+      await send([await client.publishPriceIx(admin.publicKey, feed.publicKey, new BN(252))], admin);
+      await send([await client.proposeFromOracleIx(user1.publicKey, marketId, feed.publicKey)], user1);
+      assert.strictEqual((await client.fetchMarketById(marketId)).state, STATE_RESOLVING);
+    });
+
+    it("rejects publishing from a non-authority", async () => {
+      const feed = await makeFeed(100);
+      assert.match(
+        await sendExpectFail([await client.publishPriceIx(user1.publicKey, feed.publicKey, new BN(1))], user1),
+        /Unauthorized/
+      );
     });
   });
 });

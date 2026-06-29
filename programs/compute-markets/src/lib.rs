@@ -56,8 +56,12 @@ pub const STATE_RESOLVED: u8 = 2;
 /// Voided/invalid; every outcome token redeems for half of collateral.
 pub const STATE_VOID: u8 = 3;
 
-/// Trusted single-key resolver (the only resolver kind wired today).
+/// Trusted single-key resolver: the market's `resolver` proposes the outcome.
 pub const RESOLVER_TRUSTED_KEY: u8 = 0;
+/// Oracle-feed resolver: the outcome is derived permissionlessly from an on-chain
+/// [`PriceFeed`] (the bridge target for a Switchboard On-Demand Function or a
+/// committee multisig) by comparing its value to the market's strike.
+pub const RESOLVER_ORACLE_FEED: u8 = 1;
 
 /// Maximum protocol fee (10%).
 pub const MAX_FEE_BPS: u16 = 1_000;
@@ -131,6 +135,7 @@ pub mod compute_markets {
     /// Create a new binary market. Permissionless: anyone may create one and
     /// nominate a `resolver`. Trading halts at `close_time`; the outcome may be
     /// proposed at/after `resolution_time` (`close_time <= resolution_time`).
+    #[allow(clippy::too_many_arguments)]
     pub fn create_market(
         ctx: Context<CreateMarket>,
         question: String,
@@ -139,6 +144,10 @@ pub mod compute_markets {
         resolution_time: i64,
         resolver: Pubkey,
         resolver_kind: u8,
+        oracle_feed: Pubkey,
+        oracle_strike: i64,
+        oracle_comparison: u8,
+        oracle_max_staleness: i64,
     ) -> Result<()> {
         require!(
             question.len() <= Market::MAX_QUESTION,
@@ -148,11 +157,23 @@ pub mod compute_markets {
             resolution_source.len() <= Market::MAX_SOURCE,
             ErrorCode::StringTooLong
         );
-        require!(
-            resolver_kind == RESOLVER_TRUSTED_KEY,
-            ErrorCode::UnsupportedResolverKind
-        );
-        require!(resolver != Pubkey::default(), ErrorCode::InvalidParameter);
+        match resolver_kind {
+            RESOLVER_TRUSTED_KEY => {
+                require!(resolver != Pubkey::default(), ErrorCode::InvalidParameter);
+            }
+            RESOLVER_ORACLE_FEED => {
+                require!(
+                    oracle_feed != Pubkey::default(),
+                    ErrorCode::InvalidParameter
+                );
+                require!(oracle_max_staleness > 0, ErrorCode::InvalidParameter);
+                require!(
+                    math::oracle_is_yes(0, 0, oracle_comparison).is_some(),
+                    ErrorCode::InvalidComparison
+                );
+            }
+            _ => return err!(ErrorCode::UnsupportedResolverKind),
+        }
 
         let now = Clock::get()?.unix_timestamp;
         require!(close_time <= resolution_time, ErrorCode::InvalidTimeWindow);
@@ -168,6 +189,10 @@ pub mod compute_markets {
         market.creator = ctx.accounts.creator.key();
         market.resolver = resolver;
         market.resolver_kind = resolver_kind;
+        market.oracle_feed = oracle_feed;
+        market.oracle_strike = oracle_strike;
+        market.oracle_comparison = oracle_comparison;
+        market.oracle_max_staleness = oracle_max_staleness;
         market.collateral_mint = ctx.accounts.collateral_mint.key();
         market.yes_mint = ctx.accounts.yes_mint.key();
         market.no_mint = ctx.accounts.no_mint.key();
@@ -544,6 +569,10 @@ pub mod compute_markets {
     pub fn propose_outcome(ctx: Context<ProposeOutcome>, outcome: u8) -> Result<()> {
         let _ = Side::from_u8(outcome)?;
         let market = &mut ctx.accounts.market;
+        require!(
+            market.resolver_kind == RESOLVER_TRUSTED_KEY,
+            ErrorCode::WrongResolverKind
+        );
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
         require!(
             ctx.accounts.resolver.key() == market.resolver,
@@ -559,6 +588,94 @@ pub mod compute_markets {
         emit!(OutcomeProposed {
             market: market.key(),
             resolver: ctx.accounts.resolver.key(),
+            outcome,
+            proposed_at: now,
+        });
+        Ok(())
+    }
+
+    /// Initialize an on-chain price feed. The `feed` account is created fresh
+    /// (pass a new keypair). In production its `authority` is a Switchboard
+    /// On-Demand Function's enclave key or a committee multisig — whichever bridges
+    /// the licensed off-chain index on-chain.
+    pub fn init_price_feed(
+        ctx: Context<InitPriceFeed>,
+        description: String,
+        decimals: u8,
+    ) -> Result<()> {
+        require!(
+            description.len() <= PriceFeed::MAX_DESC,
+            ErrorCode::StringTooLong
+        );
+        let feed = &mut ctx.accounts.feed;
+        feed.authority = ctx.accounts.authority.key();
+        feed.value = 0;
+        feed.decimals = decimals;
+        feed.published_at = 0;
+        feed.description = description;
+        emit!(PriceFeedInitialized {
+            feed: feed.key(),
+            authority: feed.authority,
+        });
+        Ok(())
+    }
+
+    /// Post a new value to a price feed (feed authority only). `value` is in the
+    /// feed's native fixed-point integer scale (see `decimals`).
+    pub fn publish_price(ctx: Context<PublishPrice>, value: i64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let feed = &mut ctx.accounts.feed;
+        require!(
+            ctx.accounts.authority.key() == feed.authority,
+            ErrorCode::Unauthorized
+        );
+        feed.value = value;
+        feed.published_at = now;
+        emit!(PricePublished {
+            feed: feed.key(),
+            value,
+            published_at: now,
+        });
+        Ok(())
+    }
+
+    /// Oracle resolution (step 1, permissionless): derive the proposed outcome
+    /// for a `RESOLVER_ORACLE_FEED` market by comparing the bound price feed's
+    /// value to the market's strike. Enters the same dispute window as a manual
+    /// proposal, so the guardian can still veto a manipulated feed.
+    pub fn propose_from_oracle(ctx: Context<ProposeFromOracle>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let feed_key = ctx.accounts.feed.key();
+        let feed_value = ctx.accounts.feed.value;
+        let feed_published = ctx.accounts.feed.published_at;
+
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.resolver_kind == RESOLVER_ORACLE_FEED,
+            ErrorCode::WrongResolverKind
+        );
+        require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        require!(now >= market.resolution_time, ErrorCode::TooEarlyToResolve);
+        require!(feed_published > 0, ErrorCode::FeedHasNoValue);
+        require!(
+            now.checked_sub(feed_published)
+                .ok_or(ErrorCode::MathOverflow)?
+                <= market.oracle_max_staleness,
+            ErrorCode::StaleFeed
+        );
+
+        let is_yes =
+            math::oracle_is_yes(feed_value, market.oracle_strike, market.oracle_comparison)
+                .ok_or(ErrorCode::InvalidComparison)?;
+        let outcome = if is_yes { OUTCOME_YES } else { OUTCOME_NO };
+
+        market.state = STATE_RESOLVING;
+        market.proposed_outcome = outcome;
+        market.resolved_at = now;
+
+        emit!(OutcomeProposed {
+            market: market.key(),
+            resolver: feed_key,
             outcome,
             proposed_at: now,
         });
@@ -1019,6 +1136,11 @@ pub struct Market {
     pub creator: Pubkey,
     pub resolver: Pubkey,
     pub resolver_kind: u8,
+    /// Oracle config (used when `resolver_kind == RESOLVER_ORACLE_FEED`).
+    pub oracle_feed: Pubkey,
+    pub oracle_strike: i64,
+    pub oracle_comparison: u8,
+    pub oracle_max_staleness: i64,
     pub collateral_mint: Pubkey,
     pub yes_mint: Pubkey,
     pub no_mint: Pubkey,
@@ -1054,6 +1176,10 @@ impl Market {
         + 32 // creator
         + 32 // resolver
         + 1  // resolver_kind
+        + 32 // oracle_feed
+        + 8  // oracle_strike
+        + 1  // oracle_comparison
+        + 8  // oracle_max_staleness
         + 32 // collateral_mint
         + 32 // yes_mint
         + 32 // no_mint
@@ -1106,6 +1232,23 @@ impl Market {
             }
         }
     }
+}
+
+/// An on-chain numeric price feed. Designed to be populated by a Switchboard
+/// On-Demand Function (TEE-attested) or a committee multisig bridging a licensed
+/// off-chain index; markets with `RESOLVER_ORACLE_FEED` read it to resolve.
+#[account]
+pub struct PriceFeed {
+    pub authority: Pubkey,
+    pub value: i64,
+    pub decimals: u8,
+    pub published_at: i64,
+    pub description: String,
+}
+
+impl PriceFeed {
+    pub const MAX_DESC: usize = 64;
+    pub const SPACE: usize = 8 + 32 + 8 + 1 + 8 + 4 + Self::MAX_DESC;
 }
 
 // ----------------------------- Contexts -----------------------------
@@ -1238,6 +1381,31 @@ pub struct ProposeOutcome<'info> {
     #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
     pub resolver: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitPriceFeed<'info> {
+    #[account(init, payer = authority, space = PriceFeed::SPACE)]
+    pub feed: Box<Account<'info, PriceFeed>>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PublishPrice<'info> {
+    #[account(mut)]
+    pub feed: Box<Account<'info, PriceFeed>>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ProposeFromOracle<'info> {
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(address = market.oracle_feed)]
+    pub feed: Box<Account<'info, PriceFeed>>,
+    pub cranker: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -1427,6 +1595,19 @@ pub struct PausedSet {
     pub paused: bool,
 }
 
+#[event]
+pub struct PriceFeedInitialized {
+    pub feed: Pubkey,
+    pub authority: Pubkey,
+}
+
+#[event]
+pub struct PricePublished {
+    pub feed: Pubkey,
+    pub value: i64,
+    pub published_at: i64,
+}
+
 // ----------------------------- Errors -----------------------------
 
 #[error_code]
@@ -1481,6 +1662,14 @@ pub enum ErrorCode {
     TooEarlyToVoid,
     #[msg("Nothing to claim")]
     NothingToClaim,
+    #[msg("Wrong resolver kind for this instruction")]
+    WrongResolverKind,
+    #[msg("Invalid oracle comparison code")]
+    InvalidComparison,
+    #[msg("Price feed has no published value yet")]
+    FeedHasNoValue,
+    #[msg("Price feed value is too stale to resolve")]
+    StaleFeed,
     #[msg("Arithmetic overflow")]
     MathOverflow,
 }

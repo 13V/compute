@@ -489,6 +489,22 @@ export type ComputeMarkets = {
         {
           "name": "resolverKind",
           "type": "u8"
+        },
+        {
+          "name": "oracleFeed",
+          "type": "pubkey"
+        },
+        {
+          "name": "oracleStrike",
+          "type": "i64"
+        },
+        {
+          "name": "oracleComparison",
+          "type": "u8"
+        },
+        {
+          "name": "oracleMaxStaleness",
+          "type": "i64"
         }
       ]
     },
@@ -625,6 +641,51 @@ export type ComputeMarkets = {
       "args": []
     },
     {
+      "name": "initPriceFeed",
+      "docs": [
+        "Initialize an on-chain price feed. The `feed` account is created fresh",
+        "(pass a new keypair). In production its `authority` is a Switchboard",
+        "On-Demand Function's enclave key or a committee multisig — whichever bridges",
+        "the licensed off-chain index on-chain."
+      ],
+      "discriminator": [
+        27,
+        209,
+        184,
+        5,
+        152,
+        116,
+        136,
+        16
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "description",
+          "type": "string"
+        },
+        {
+          "name": "decimals",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "initialize",
       "docs": [
         "Initialize the global config (one per deployment).",
@@ -692,6 +753,59 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "proposeFromOracle",
+      "docs": [
+        "Oracle resolution (step 1, permissionless): derive the proposed outcome",
+        "for a `RESOLVER_ORACLE_FEED` market by comparing the bound price feed's",
+        "value to the market's strike. Enters the same dispute window as a manual",
+        "proposal, so the guardian can still veto a manipulated feed."
+      ],
+      "discriminator": [
+        244,
+        4,
+        149,
+        46,
+        51,
+        227,
+        30,
+        189
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "feed"
+        },
+        {
+          "name": "cranker",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "proposeOutcome",
       "docs": [
         "Step 1 of resolution: the market's `resolver` proposes a winning outcome",
@@ -741,6 +855,39 @@ export type ComputeMarkets = {
         {
           "name": "outcome",
           "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "publishPrice",
+      "docs": [
+        "Post a new value to a price feed (feed authority only). `value` is in the",
+        "feed's native fixed-point integer scale (see `decimals`)."
+      ],
+      "discriminator": [
+        117,
+        13,
+        6,
+        171,
+        29,
+        204,
+        11,
+        1
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "value",
+          "type": "i64"
         }
       ]
     },
@@ -1415,6 +1562,19 @@ export type ComputeMarkets = {
         198,
         154
       ]
+    },
+    {
+      "name": "priceFeed",
+      "discriminator": [
+        189,
+        103,
+        252,
+        23,
+        152,
+        35,
+        243,
+        156
+      ]
     }
   ],
   "events": [
@@ -1520,6 +1680,32 @@ export type ComputeMarkets = {
         77,
         196,
         150
+      ]
+    },
+    {
+      "name": "priceFeedInitialized",
+      "discriminator": [
+        215,
+        208,
+        148,
+        233,
+        198,
+        216,
+        185,
+        183
+      ]
+    },
+    {
+      "name": "pricePublished",
+      "discriminator": [
+        161,
+        182,
+        51,
+        133,
+        25,
+        192,
+        179,
+        140
       ]
     },
     {
@@ -1677,6 +1863,26 @@ export type ComputeMarkets = {
     },
     {
       "code": 6025,
+      "name": "wrongResolverKind",
+      "msg": "Wrong resolver kind for this instruction"
+    },
+    {
+      "code": 6026,
+      "name": "invalidComparison",
+      "msg": "Invalid oracle comparison code"
+    },
+    {
+      "code": 6027,
+      "name": "feedHasNoValue",
+      "msg": "Price feed has no published value yet"
+    },
+    {
+      "code": 6028,
+      "name": "staleFeed",
+      "msg": "Price feed value is too stale to resolve"
+    },
+    {
+      "code": 6029,
       "name": "mathOverflow",
       "msg": "Arithmetic overflow"
     }
@@ -1778,6 +1984,25 @@ export type ComputeMarkets = {
           {
             "name": "resolverKind",
             "type": "u8"
+          },
+          {
+            "name": "oracleFeed",
+            "docs": [
+              "Oracle config (used when `resolver_kind == RESOLVER_ORACLE_FEED`)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "oracleStrike",
+            "type": "i64"
+          },
+          {
+            "name": "oracleComparison",
+            "type": "u8"
+          },
+          {
+            "name": "oracleMaxStaleness",
+            "type": "i64"
           },
           {
             "name": "collateralMint",
@@ -2001,6 +2226,75 @@ export type ComputeMarkets = {
           {
             "name": "payout",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "priceFeed",
+      "docs": [
+        "An on-chain numeric price feed. Designed to be populated by a Switchboard",
+        "On-Demand Function (TEE-attested) or a committee multisig bridging a licensed",
+        "off-chain index; markets with `RESOLVER_ORACLE_FEED` read it to resolve."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "value",
+            "type": "i64"
+          },
+          {
+            "name": "decimals",
+            "type": "u8"
+          },
+          {
+            "name": "publishedAt",
+            "type": "i64"
+          },
+          {
+            "name": "description",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "priceFeedInitialized",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pricePublished",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "value",
+            "type": "i64"
+          },
+          {
+            "name": "publishedAt",
+            "type": "i64"
           }
         ]
       }

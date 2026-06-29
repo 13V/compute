@@ -30,8 +30,13 @@ export interface CreateMarketParams {
   /** Unix seconds: the outcome may be proposed at/after this time. */
   resolutionTime: BN;
   resolver: PublicKey;
-  /** Resolver kind; only RESOLVER_TRUSTED_KEY (0) is supported today. */
+  /** Resolver kind: RESOLVER_TRUSTED_KEY (0) or RESOLVER_ORACLE_FEED (1). */
   resolverKind?: number;
+  /** Oracle config (required when resolverKind === RESOLVER_ORACLE_FEED). */
+  oracleFeed?: PublicKey;
+  oracleStrike?: BN;
+  oracleComparison?: number;
+  oracleMaxStaleness?: BN;
 }
 
 /**
@@ -111,7 +116,11 @@ export class ComputeClient {
         params.closeTime,
         params.resolutionTime,
         params.resolver,
-        params.resolverKind ?? 0
+        params.resolverKind ?? 0,
+        params.oracleFeed ?? PublicKey.default,
+        params.oracleStrike ?? new BN(0),
+        params.oracleComparison ?? 0,
+        params.oracleMaxStaleness ?? new BN(0)
       )
       .accountsPartial({
         config,
@@ -218,6 +227,37 @@ export class ComputeClient {
     return this.program.methods
       .proposeOutcome(outcome)
       .accountsPartial({ market: a.market, resolver })
+      .instruction();
+  }
+
+  // ----- oracle feed -----
+
+  async fetchPriceFeed(feed: PublicKey) {
+    return this.program.account.priceFeed.fetch(feed);
+  }
+
+  /** Init a fresh price feed account. Sign the tx with the `feed` keypair. */
+  async initPriceFeedIx(authority: PublicKey, feed: PublicKey, description: string, decimals: number) {
+    return this.program.methods
+      .initPriceFeed(description, decimals)
+      .accountsPartial({ feed, authority, systemProgram: SystemProgram.programId })
+      .instruction();
+  }
+
+  /** Publish a value to a feed (feed authority only). */
+  async publishPriceIx(authority: PublicKey, feed: PublicKey, value: BN) {
+    return this.program.methods
+      .publishPrice(value)
+      .accountsPartial({ feed, authority })
+      .instruction();
+  }
+
+  /** Permissionlessly derive an oracle market's proposed outcome from its feed. */
+  async proposeFromOracleIx(cranker: PublicKey, marketId: number | BN, feed: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    return this.program.methods
+      .proposeFromOracle()
+      .accountsPartial({ market: a.market, feed, cranker })
       .instruction();
   }
 
