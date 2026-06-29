@@ -39,7 +39,7 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -81,7 +81,7 @@ jobs:
         uses: ./.github/actions/setup-solana
 
       - name: Cache cargo + anchor build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -180,7 +180,7 @@ jobs:
           cache: "npm"
 
       - name: Cache cargo + sbf artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -290,7 +290,7 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
