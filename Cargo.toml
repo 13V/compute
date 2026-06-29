@@ -2,6 +2,28 @@
 members = ["programs/*"]
 resolver = "2"
 
+# Workspace-level package metadata. Member crates can inherit individual fields
+# with `license.workspace = true`, etc. (the on-chain crate does not opt in yet;
+# adding `[package] license.workspace = true` there would activate this).
+[workspace.package]
+license = "Apache-2.0"
+
+# Conservative, high-signal lint table. These only take effect for member crates
+# that opt in via `[lints] workspace = true` in their own Cargo.toml. The on-chain
+# `compute-markets` crate currently has its own `[lints.rust]` block (it does not
+# set `workspace = true`), so this table is inert for now — it is the documented
+# baseline the owner can switch on by adding `[lints] workspace = true` (merging it
+# with the crate's existing rust lints).
+#
+# Kept deliberately gentle (`warn`, not `deny`) so flipping the switch never breaks
+# the build: it surfaces fallible-call hygiene without blocking. NOTE: the program's
+# `#[cfg(test)]` math suite uses `.unwrap()` freely, so these are intentionally NOT
+# wired into the `-D warnings` CI gate to avoid failing on test-only unwraps.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
 [profile.release]
 overflow-checks = true
 lto = "fat"

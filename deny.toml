@@ -1,0 +1,97 @@
+# cargo-deny configuration for the Compute workspace.
+# Run with: cargo deny check   (checks advisories, bans, licenses, sources)
+#
+# Scope note: the dependency graph here is the *host* graph (anchor-lang /
+# anchor-spl + the Solana SDK stack). It is wide and pulls in several crates in
+# multiple major versions — that is normal for the Anchor/Solana ecosystem, so
+# duplicate-version detection is a `warn`, not a hard fail, with the known
+# borsh 0.10/1.x split skipped explicitly below.
+
+[graph]
+# Only evaluate the host target we actually build/test on in CI. (The SBF target
+# is built by platform-tools, not cargo-deny.)
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+all-features = false
+
+# ---------------------------------------------------------------------------
+# Advisories (RUSTSEC) — deny everything by default; document any ignore.
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# `unmaintained = "all"` can be noisy on the Solana tree; restrict to crates we
+# pull directly so transitive abandonware in the SDK doesn't block CI on day one.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # No advisories are currently ignored. If an UNPATCHABLE transitive RUSTSEC
+    # advisory appears (e.g. forced by the Solana SDK with no upgrade path),
+    # add the "RUSTSEC-YYYY-NNNN" id here WITH a one-line justification and a
+    # link to the upstream tracking issue. Prefer bumping the dependency first.
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — allow common permissive licenses only.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# SPDX confidence threshold for matching license text in crates.
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+# Crates that ship without machine-readable SPDX metadata can be clarified with
+# `[[licenses.clarify]]` blocks if `cargo deny check licenses` reports them as
+# unlicensed. None are needed for the current graph; add them here (name +
+# expression + license-file hash) only when a real unmatched crate appears, so
+# a wrong/guessed hash never becomes the thing that breaks CI.
+
+# ---------------------------------------------------------------------------
+# Bans / duplicate versions.
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate major versions are common in the Solana stack (two borsh, two syn,
+# multiple rand/getrandom). Warn so they're visible without blocking CI.
+multiple-versions = "warn"
+wildcard = "allow"
+# Prefer the highest semver when several are present (informational only).
+highest-version = true
+deny = [
+    # Add crates here that must never appear (e.g. known-malicious or
+    # unvetted crypto). None today.
+]
+skip = [
+    # Known/accepted duplicate: Anchor's account (de)serialization pulls borsh
+    # 1.x, while parts of the older Solana SDK surface still pull borsh 0.10.x.
+    # There is no single-version resolution without upgrading the whole SDK, so
+    # this split is explicitly accepted. Re-evaluate on the next Anchor/Solana bump.
+    { name = "borsh", version = "=0.10.4" },
+    { name = "borsh-derive", version = "=0.10.4" },
+]
+skip-tree = [
+    # If a single dependency subtree is responsible for a cluster of duplicate
+    # versions (e.g. an old solana-program pin), skip it here by name+version
+    # rather than listing every leaf. None pinned yet.
+]
+
+# ---------------------------------------------------------------------------
+# Sources — only allow crates from crates.io. Any git/registry source must be
+# added intentionally.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

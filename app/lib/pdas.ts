@@ -14,7 +14,15 @@ export const OUTCOME_YES = 0;
 export const OUTCOME_NO = 1;
 
 export const STATE_OPEN = 0;
-export const STATE_RESOLVED = 1;
+export const STATE_RESOLVING = 1;
+export const STATE_RESOLVED = 2;
+export const STATE_VOID = 3;
+
+/** Resolver kinds (only TRUSTED_KEY is wired today; others reserved). */
+export const RESOLVER_TRUSTED_KEY = 0;
+
+export const VOID_REASON_DISPUTE = 0;
+export const VOID_REASON_STALE = 1;
 
 /** USDC and outcome tokens both use 6 decimals. */
 export const DECIMALS = 6;

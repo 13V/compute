@@ -1,0 +1,341 @@
+name: CI
+
+# Track C — CI/CD + supply-chain hygiene for the Compute Solana/Anchor monorepo.
+#
+# Jobs run in parallel except where `needs:` enforces an ordering. The heavy
+# Solana toolchain (Agave CLI + Anchor) is shared via the local composite action
+# at .github/actions/setup-solana.
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Host Rust: format, clippy, unit tests. Fast, no Solana toolchain needed.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: rust (fmt + clippy + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins channel=1.94.1 with rustfmt+clippy, so a plain
+      # `rustup show` materializes exactly that toolchain + components.
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      # clippy with -D warnings. The compute-markets crate carries its own
+      # `[lints.rust]` block (unexpected_cfgs/deprecated = "allow") to silence the
+      # Anchor macro-generated cfg + deprecation noise that is not actionable in
+      # this crate, so this gate runs clean on the real findings without extra
+      # RUSTFLAGS. Verified locally: exit 0.
+      - name: cargo clippy -D warnings
+        run: cargo clippy -p compute-markets --all-targets -- -D warnings
+
+      - name: cargo test (host unit tests)
+        run: cargo test -p compute-markets --lib
+
+  # ---------------------------------------------------------------------------
+  # 2. Anchor build + vendored-IDL drift + declare_id reproducibility.
+  #    A full `anchor build` is heavy/occasionally flaky on hosted runners, so
+  #    the build itself is `continue-on-error` (it will not block merges), but
+  #    the IDL drift assertion is a HARD failure when the build does succeed.
+  # ---------------------------------------------------------------------------
+  anchor-build:
+    name: anchor-build (+ IDL drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Setup Solana + Anchor
+        uses: ./.github/actions/setup-solana
+
+      - name: Cache cargo + anchor build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: anchor-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: anchor-build-${{ runner.os }}-
+
+      # Heavy step — do not let transient SBF/toolchain hiccups block the gate.
+      # The drift + program-id checks below `if: success()`-guard themselves on
+      # the produced artifacts.
+      - name: anchor build
+        id: anchor_build
+        continue-on-error: true
+        run: anchor build
+
+      - name: Vendored-IDL drift check (target/ vs sdk/idl)
+        if: steps.anchor_build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          BUILT="target/idl/compute_markets.json"
+          VENDORED="sdk/idl/compute_markets.json"
+          if [ ! -f "$BUILT" ]; then
+            echo "::error::expected $BUILT after anchor build, not found"
+            exit 1
+          fi
+          if ! diff -u "$VENDORED" "$BUILT"; then
+            echo "::error::Vendored IDL ($VENDORED) is out of date vs the freshly"
+            echo "::error::built IDL. Run 'anchor build' and copy target/idl/*.json"
+            echo "::error::into sdk/idl/ (and re-sync app/lib/idl)."
+            exit 1
+          fi
+          echo "Vendored IDL matches freshly built IDL."
+
+      # declare_id! reproducibility caveat: a fresh `anchor build` regenerates a
+      # program keypair unless one is committed/provided, so the built program id
+      # can legitimately differ from the source `declare_id!` on a clean runner.
+      # We therefore compare the built .so's keypair id against declare_id! and
+      # only WARN on mismatch (informational), failing only if we cannot read the
+      # source id at all. The authoritative id is the one in Anchor.toml/lib.rs.
+      - name: declare_id! vs built program id (informational)
+        if: steps.anchor_build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          DECLARED="$(grep -oE 'declare_id!\("[^"]+"\)' programs/compute-markets/src/lib.rs \
+            | sed -E 's/declare_id!\("([^"]+)"\)/\1/')"
+          if [ -z "$DECLARED" ]; then
+            echo "::error::could not read declare_id! from lib.rs"
+            exit 1
+          fi
+          echo "declare_id! in source: $DECLARED"
+          KEYPAIR="target/deploy/compute_markets-keypair.json"
+          if [ -f "$KEYPAIR" ]; then
+            BUILT_ID="$(solana-keygen pubkey "$KEYPAIR")"
+            echo "built program keypair id: $BUILT_ID"
+            if [ "$DECLARED" != "$BUILT_ID" ]; then
+              echo "::warning::built program id ($BUILT_ID) != declare_id! ($DECLARED)."
+              echo "::warning::Expected on a clean runner that regenerates the keypair."
+              echo "::warning::For reproducible deploys, commit the program keypair or"
+              echo "::warning::set [programs.*] in Anchor.toml and run 'anchor keys sync'."
+            else
+              echo "built program id matches declare_id!."
+            fi
+          else
+            echo "::warning::$KEYPAIR not produced; skipping program-id comparison."
+          fi
+
+      - name: Surface anchor build failure
+        if: steps.anchor_build.outcome != 'success'
+        run: |
+          echo "::warning::'anchor build' did not succeed on this runner."
+          echo "::warning::IDL drift + program-id checks were skipped. Investigate the"
+          echo "::warning::anchor build step logs; this step is non-blocking by design."
+
+  # ---------------------------------------------------------------------------
+  # 3. Integration: build the SBF program, then run the self-contained
+  #    ts-mocha suite (scripts/test-integration.sh manages its own validator).
+  #    Reuses the same Solana toolchain setup as anchor-build.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: integration (ts-mocha vs test-validator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Setup Solana + Anchor
+        uses: ./.github/actions/setup-solana
+
+      - name: Use Node from .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Cache cargo + sbf artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: integration-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: integration-${{ runner.os }}-
+
+      - name: npm ci (root TS workspace)
+        run: npm ci
+
+      - name: cargo build-sbf
+        run: cargo build-sbf
+
+      - name: Integration tests
+        run: bash scripts/test-integration.sh
+
+  # ---------------------------------------------------------------------------
+  # 4. SDK drift: the canonical SDK lives in sdk/{pdas,amm,client}.ts + sdk/idl,
+  #    and is copied into app/lib/. The copies carry a one-line copy-header
+  #    comment that the originals don't, so we strip the app copy's first line
+  #    before diffing the .ts mirrors. IDL .ts files carry a generator header on
+  #    BOTH sides (different text), so we strip line 1 from both. IDL .json has
+  #    no comments and must match byte-for-byte.
+  # ---------------------------------------------------------------------------
+  sdk-drift:
+    name: sdk-drift (sdk vs app/lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diff app/lib mirrors against sdk/
+        run: |
+          set -uo pipefail
+          fail=0
+
+          # app/lib/*.ts has a leading "// Copied from /sdk ..." header line that
+          # the sdk/*.ts originals do not. Strip app copy line 1, compare to full sdk.
+          for f in pdas amm client; do
+            if ! diff -u "sdk/$f.ts" <(tail -n +2 "app/lib/$f.ts"); then
+              echo "::error::app/lib/$f.ts has drifted from sdk/$f.ts"
+              fail=1
+            fi
+          done
+
+          # IDL .ts: both sides carry a (different) generator/copy header on line 1.
+          if ! diff -u <(tail -n +2 "sdk/idl/compute_markets.ts") \
+                       <(tail -n +2 "app/lib/idl/compute_markets.ts"); then
+            echo "::error::app/lib/idl/compute_markets.ts has drifted from sdk/idl/compute_markets.ts"
+            fail=1
+          fi
+
+          # IDL .json: no comments — must match exactly.
+          if ! diff -u "sdk/idl/compute_markets.json" "app/lib/idl/compute_markets.json"; then
+            echo "::error::app/lib/idl/compute_markets.json has drifted from sdk/idl/compute_markets.json"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::SDK copy in app/lib is out of sync with sdk/. Re-copy sdk/{pdas,amm,client}.ts"
+            echo "::error::and sdk/idl/* into app/lib/ (preserving the app copy-header comment)."
+            exit 1
+          fi
+          echo "SDK mirror is in sync."
+
+  # ---------------------------------------------------------------------------
+  # 5. App: typecheck + Next.js production build.
+  #    (No `next lint` step: it would require an ESLint config that Track C is
+  #    scoped out of adding to app/, and `next lint` prompts interactively when
+  #    none exists, which would hang CI.)
+  # ---------------------------------------------------------------------------
+  app:
+    name: app (typecheck + next build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node from .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        working-directory: app
+        run: npx tsc --noEmit
+
+      - name: Next.js production build
+        working-directory: app
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # 6. Supply-chain: cargo-deny (advisories/bans/licenses/sources) + npm audit.
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: supply-chain (cargo-deny + npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'deny.toml') }}
+          restore-keys: cargo-deny-${{ runner.os }}-
+
+      - name: Install cargo-deny
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-deny >/dev/null 2>&1; then
+            cargo install cargo-deny --locked
+          fi
+          cargo deny --version
+
+      - name: cargo deny check
+        run: cargo deny check advisories bans licenses sources
+
+      - name: Use Node from .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+
+      # npm audit at high severity. The Solana/web3.js stack transitively forces
+      # a small set of UNPATCHED high advisories that cannot be removed without
+      # dropping the SDK (notably `bigint-buffer` GHSA buffer-overflow via
+      # @solana/web3.js -> @solana/buffer-layout-utils -> @solana/spl-token, and
+      # a couple of dev-only advisories). Dependency changes are out of Track C's
+      # scope, so these steps are reported but non-blocking (`|| true`). They
+      # print the full audit so regressions stay visible.
+      #
+      # ACTION FOR OWNER (cannot be fixed from Track C — requires dep bumps):
+      #   * app/: Next.js 14.2.15 has a CRITICAL advisory — bump to the latest
+      #     patched 14.2.x. `protobufjs` (critical) arrives via the Trezor/Reown
+      #     wallet adapters; review whether those adapters are needed.
+      #   * bigint-buffer (high) is upstream-unpatched in the Solana stack.
+      - name: npm audit (root, high)
+        run: |
+          echo "## root npm audit (informational; non-blocking) ##"
+          npm audit --audit-level=high || true
+
+      - name: npm audit (app, high)
+        working-directory: app
+        run: |
+          echo "## app npm audit (informational; non-blocking) ##"
+          echo "NOTE: includes a CRITICAL Next.js advisory — owner should bump Next 14.2.x."
+          npm audit --audit-level=high || true

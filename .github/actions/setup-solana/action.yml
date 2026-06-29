@@ -1,0 +1,85 @@
+name: "Setup Solana + Anchor"
+description: >
+  Installs the Agave/Anza Solana CLI and the Anchor CLI at the versions this repo
+  is built against (Agave 4.0.2 / Anchor 0.31.1), wires them onto PATH, and
+  generates a throwaway localnet keypair. Shared by the anchor-build and
+  integration jobs so the toolchain is configured in exactly one place.
+
+inputs:
+  solana-version:
+    description: "Agave/Anza release tag to install (without leading v)."
+    required: false
+    default: "4.0.2"
+  anchor-version:
+    description: "Anchor CLI version (must match Anchor.toml's anchor_version)."
+    required: false
+    default: "0.31.1"
+
+runs:
+  using: "composite"
+  steps:
+    # --- Agave / Anza Solana CLI (provides cargo-build-sbf, solana-test-validator) ---
+    - name: Cache Solana CLI install
+      id: cache-solana
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/share/solana/install
+        key: solana-cli-${{ runner.os }}-${{ inputs.solana-version }}
+
+    - name: Install Agave/Anza Solana CLI
+      if: steps.cache-solana.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Official Anza install script. Pins the exact release tag.
+        sh -c "$(curl -sSfL https://release.anza.xyz/v${{ inputs.solana-version }}/install)"
+
+    - name: Put Solana on PATH
+      shell: bash
+      run: echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+    - name: Verify Solana toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        solana --version
+        cargo-build-sbf --version || true
+
+    # --- Anchor CLI via AVM (Anchor Version Manager) ---
+    - name: Cache Anchor (avm + cli) binaries
+      id: cache-anchor
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.avm
+          ~/.cargo/bin/avm
+          ~/.cargo/bin/anchor
+        key: anchor-${{ runner.os }}-${{ inputs.anchor-version }}
+
+    - name: Install AVM + Anchor CLI
+      if: steps.cache-anchor.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo install --git https://github.com/coral-xyz/anchor avm --force
+        avm install ${{ inputs.anchor-version }}
+        avm use ${{ inputs.anchor-version }}
+
+    - name: Verify Anchor toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        avm use ${{ inputs.anchor-version }} || true
+        anchor --version
+
+    # --- Throwaway localnet keypair (test-validator + provider wallet) ---
+    - name: Generate localnet keypair
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.config/solana"
+        if [ ! -f "$HOME/.config/solana/id.json" ]; then
+          solana-keygen new --no-bip39-passphrase --force \
+            -o "$HOME/.config/solana/id.json"
+        fi
+        solana config set --url localhost

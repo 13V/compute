@@ -1,6 +1,7 @@
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { RPC_URL } from "./WalletProviders";
+import { clusterFromRpc } from "../lib/format";
 
 // WalletMultiButton renders browser-only; load without SSR.
 const WalletMultiButton = dynamic(
@@ -12,11 +13,15 @@ const WalletMultiButton = dynamic(
 );
 
 export default function TopBar() {
+  const cluster = clusterFromRpc(RPC_URL);
   return (
     <div className="topbar">
       <Link href="/" className="brand">
         <h1>Compute</h1>
-        <span className="tag">prediction markets · {RPC_URL.replace(/^https?:\/\//, "")}</span>
+        <span className="tag">
+          prediction markets{" "}
+          <span className={`badge cluster ${cluster}`}>{cluster}</span>
+        </span>
       </Link>
       <WalletMultiButton />
     </div>

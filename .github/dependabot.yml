@@ -1,0 +1,38 @@
+version: 2
+
+# Keep the three dependency surfaces patched: Cargo (host crates), the root TS
+# workspace, the Next.js app, and the GitHub Actions we pin. Grouped minor/patch
+# PRs keep noise down; majors come through individually for review.
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-root-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/app"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      app-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

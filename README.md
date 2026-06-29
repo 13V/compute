@@ -2,20 +2,24 @@
 
 **On-chain prediction markets for trading on compute** — a Solana program (+ SDK and
 web app) where users connect a wallet and trade YES/NO on compute-related outcomes
-(GPU rental prices, AI milestones, …). This repo contains a working, tested MVP.
+(GPU rental prices, AI milestones, …). This repo contains a working, tested MVP with a
+**hardened, defense-in-depth settlement path**.
 
-> Strategy & rationale (what to trade, mechanism choice, the oracle problem, roadmap):
-> see [`docs/RESEARCH.md`](docs/RESEARCH.md).
+> - Strategy & rationale (what to trade, mechanism choice, the oracle problem, roadmap):
+>   [`docs/RESEARCH.md`](docs/RESEARCH.md).
+> - Audit roadmap / path to world-class: [`docs/WORLDCLASS.md`](docs/WORLDCLASS.md).
+> - Architecture, full reference, threat model, deployment, and operations docs: see
+>   [Documentation](#documentation).
 
 ## What's here
 
 | Piece | Path | Status |
 |---|---|---|
-| Anchor program (FPMM market) | `programs/compute-markets/` | ✅ builds to BPF, tested |
-| Pure AMM/payout math + unit tests | `programs/compute-markets/src/math.rs` | ✅ 13 tests incl. proptest |
-| End-to-end integration tests | `tests/compute_markets.ts` | ✅ 14 tests on a real validator |
-| TypeScript SDK | `sdk/` | ✅ PDAs, AMM quotes, typed client |
-| Web app (wallet + trading) | `app/` | ✅ Next.js, production build green |
+| Anchor program (FPMM market) | `programs/compute-markets/` | builds to BPF, tested |
+| Pure AMM/payout math + unit tests | `programs/compute-markets/src/math.rs` | unit + proptest |
+| End-to-end integration tests | `tests/` | run on a real validator |
+| TypeScript SDK | `sdk/` | PDAs, AMM quotes, typed client |
+| Web app (wallet + trading) | `app/` | Next.js |
 
 ## How it works (mechanism)
 
@@ -27,26 +31,64 @@ pricing rather than waiting for a counterparty.
 - **Buy** invests collateral → mints a full set into the pool → the constant-product swap
   returns the bought outcome to the trader.
 - **Sell** returns outcome tokens → the pool merges a full set out → pays collateral.
-- **Resolve** (the market's `resolver` key, an oracle stand-in) picks the winning side.
+- **Resolve** is **two steps**: the market's `resolver` *proposes* an outcome, then —
+  after a dispute window — anyone *finalizes* it.
 - **Redeem** burns winning tokens 1:1 for collateral. The losing side is worthless.
 
-All rounding favors the pool, so the constant product never decreases — proven by a 2,000-case
-property test. The program also tracks a conservation invariant asserted throughout the
-integration suite: `vault == collateral_backing + accrued_fees`, and during trading
-`yes_supply == no_supply == collateral_backing`.
+All rounding favors the pool, so the constant product never decreases — proven by a
+property test. The program tracks a conservation invariant asserted throughout the
+integration suite: `vault == market.collateral + market.fee_accrued`, and during trading
+`yes_supply == no_supply == market.collateral`.
 
-Instructions: `initialize` · `create_market` · `seed_liquidity` · `buy` · `sell` · `resolve`
-· `redeem` · `claim_pool` · `collect_fees`.
+### Lifecycle
+
+```
+initialize → create_market → seed_liquidity → buy/sell (until close_time)
+  → propose_outcome (resolver, at/after resolution_time)
+  → [dispute window: dispute_period]
+  → finalize_outcome (permissionless)  → redeem / claim_pool / collect_fees
+```
+
+States: `OPEN=0 → RESOLVING=1 → RESOLVED=2`, or `→ VOID=3`. Outcomes: `YES=0`, `NO=1`.
+
+### Settlement defenses (the hardened part)
+
+A manual resolver is a trusted component, so settlement is defended in depth:
+
+- **Two-step resolution + timelock.** The resolver only *proposes*; payouts unlock only
+  after `config.dispute_period` via permissionless `finalize_outcome`.
+- **Guardian veto.** During the dispute window the guardian can `dispute_void` a bad
+  proposal → `redeem_void` 50/50 refund (each token = half collateral).
+- **Liveness escape hatch.** If the resolver never proposes, anyone may `void_stale` the
+  market 7 days (`VOID_GRACE_PERIOD`) after `resolution_time`, so collateral is never
+  stranded.
+- **Trading halts at `close_time`** (`close_time <= resolution_time`) — no informed
+  last-look.
+- **Pause switch.** Admin or guardian can pause trading in an incident.
+- **Two-step admin transfer** (`set_admin` → `accept_admin`).
+- **Forward-compat oracles.** `resolver_kind` + 64 reserved bytes leave room for pluggable
+  Switchboard/Pyth/optimistic resolvers without a layout-breaking change — but only the
+  trusted-key resolver (`resolver_kind = 0`) is wired today.
+
+### Instructions (18)
+
+`initialize` · `create_market` · `seed_liquidity` · `buy` · `sell` · `propose_outcome` ·
+`finalize_outcome` · `dispute_void` · `void_stale` · `redeem` · `redeem_void` ·
+`claim_pool` · `collect_fees` · `set_paused` · `set_fee_bps` · `set_guardian` ·
+`set_admin` · `accept_admin`.
+
+Full surface (every instruction, account, error, event, PDA seed) is in
+[`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ## Repo layout
 
 ```
 programs/compute-markets/   Anchor/Rust program (lib.rs + math.rs)
-sdk/                        TS SDK: pdas.ts, amm.ts, client.ts, idl/ (vendored IDL+types)
+sdk/                        TS SDK: pdas, amm, client, idl/ (vendored IDL+types)
 tests/                      ts-mocha integration tests (run on solana-test-validator)
-app/                        Next.js frontend (wallet connect + trade/redeem/resolve)
+app/                        Next.js frontend (wallet connect + trade/redeem)
 scripts/                    setup.sh (toolchain) + test-integration.sh (test runner)
-docs/RESEARCH.md            product & architecture research
+docs/                       research, audit roadmap, and the docs linked below
 ```
 
 ## Quick start
@@ -74,13 +116,13 @@ npm run dev
 ```
 
 `anchor build` regenerates the IDL/types under `target/`; the SDK vendors a copy in
-`sdk/idl/` and the app in `app/lib/idl/` so both are self-contained — re-copy if the program
-changes.
+`sdk/idl/` and the app in `app/lib/idl/` so both are self-contained. **Re-vendor both after
+any program change** — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the exact procedure.
 
 ## Deploying
 
-The program id is fixed in `declare_id!` / `Anchor.toml` (`8xv1L7757szxo2XPrQL5AERPGZrJaYRKgqB9RgFkQCU2`).
-To deploy under your own key:
+The program id is fixed in `declare_id!` / `Anchor.toml`
+(`8xv1L7757szxo2XPrQL5AERPGZrJaYRKgqB9RgFkQCU2`). To deploy under your own key:
 
 ```bash
 solana-keygen new -o target/deploy/compute_markets-keypair.json   # your program key
@@ -88,10 +130,32 @@ anchor keys sync                                                   # update decl
 anchor build && anchor deploy --provider.cluster devnet
 ```
 
-## MVP scope & what's next
+After deploying, run the one-time, **irreversible** `initialize` to create the global
+config, then `create_market` + `seed_liquidity`. The full runbook (including
+upgrade-authority custody via a Squads multisig) is in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md); resolver/guardian/admin procedures are in
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
-This MVP is intentionally focused: binary markets, FPMM trading, single-seed liquidity, and a
-**trusted resolver key** standing in for the oracle. The research doc lays out the path beyond
-it — the load-bearing next steps are a **real settlement oracle** (a licensed GPU index bridged
-on-chain via Switchboard, plus an optimistic-oracle dispute layer) and **scalar/range markets**
-for continuous compute prices. Not audited; do not use with real funds.
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, the FPMM split/swap math, account + PDA model, resolution state machine, event flow. |
+| [`docs/REFERENCE.md`](docs/REFERENCE.md) | Exhaustive surface: PDA seeds, instructions, accounts, errors, events. |
+| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Trusted roles & powers, defenses, residual trust, non-goals, proven invariants. |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Build → deploy → initialize → create/seed runbook + key custody. |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Resolver checklist, guardian playbook, cranking, fee sweeps, monitoring. |
+| [`docs/RESEARCH.md`](docs/RESEARCH.md) | Product & mechanism research, the oracle problem, roadmap. |
+| [`docs/WORLDCLASS.md`](docs/WORLDCLASS.md) | Audit findings and the path from MVP to world-class. |
+| [`SECURITY.md`](SECURITY.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`LICENSE`](LICENSE) | Disclosure policy · dev + IDL re-vendoring · Apache-2.0. |
+
+## MVP scope & limitations
+
+This MVP is intentionally focused: **binary** markets, FPMM trading, **single-seed**
+liquidity, and a **trusted resolver key** (defended in depth, but not a real oracle). Known
+non-goals today: no real oracle (Switchboard/Pyth/optimistic are designed-for but
+unimplemented), no scalar/range markets, no multi-LP shares, and the guardian can only
+*void* a bad proposal (50/50 refund), not correct it. The load-bearing next steps are a
+**real settlement oracle** and **scalar/range markets** — see
+[`docs/RESEARCH.md`](docs/RESEARCH.md) and [`docs/WORLDCLASS.md`](docs/WORLDCLASS.md).
+**Not audited; do not use with real funds.**

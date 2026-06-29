@@ -10,28 +10,37 @@ import {
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountIdempotentInstruction,
 } from "@solana/spl-token";
 
 import { ComputeMarkets } from "./idl/compute_markets";
 import idl from "./idl/compute_markets.json";
-import {
-  configPda,
-  deriveMarketAccounts,
-  marketPda,
-  OUTCOME_YES,
-  OUTCOME_NO,
-} from "./pdas";
+import { configPda, deriveMarketAccounts, marketPda, OUTCOME_YES } from "./pdas";
 
 export * from "./pdas";
 export * from "./amm";
 export type { ComputeMarkets };
 
+/** Parameters for creating a market. */
+export interface CreateMarketParams {
+  question: string;
+  resolutionSource: string;
+  /** Unix seconds: trading halts at this time. Must be <= resolutionTime. */
+  closeTime: BN;
+  /** Unix seconds: the outcome may be proposed at/after this time. */
+  resolutionTime: BN;
+  resolver: PublicKey;
+  /** Resolver kind; only RESOLVER_TRUSTED_KEY (0) is supported today. */
+  resolverKind?: number;
+}
+
 /**
  * High-level client for the Compute Markets program. Wraps the Anchor `Program`
  * and hides PDA/ATA plumbing so the frontend and tests can call a clean API.
+ *
+ * Market ids are assigned sequentially by the program from `config.market_count`;
+ * `createMarketIx` derives the next id internally so callers never guess it.
  */
 export class ComputeClient {
   readonly program: Program<ComputeMarkets>;
@@ -68,29 +77,43 @@ export class ComputeClient {
     return this.program.account.market.all();
   }
 
-  // ----- instruction builders -----
+  /** The id the next `create_market` will assign. */
+  async nextMarketId(): Promise<number> {
+    const cfg = await this.fetchConfig();
+    return cfg.marketCount.toNumber();
+  }
 
-  async initializeIx(admin: PublicKey, collateralMint: PublicKey, feeBps: number) {
+  // ----- setup -----
+
+  async initializeIx(admin: PublicKey, collateralMint: PublicKey, feeBps: number, disputePeriod: BN, guardian: PublicKey) {
     const [config] = configPda(this.programId);
     return this.program.methods
-      .initialize(feeBps)
+      .initialize(feeBps, disputePeriod, guardian)
       .accountsPartial({ config, collateralMint, admin, systemProgram: SystemProgram.programId })
       .instruction();
   }
 
+  /**
+   * Build a `create_market` instruction. Returns the instruction plus the
+   * `marketId` it will create (derived from the live `config.market_count`).
+   */
   async createMarketIx(
     creator: PublicKey,
-    marketId: number | BN,
-    question: string,
-    resolutionSource: string,
-    resolutionTime: BN,
-    resolver: PublicKey,
+    params: CreateMarketParams,
     collateralMint: PublicKey
-  ) {
+  ): Promise<{ ix: TransactionInstruction; marketId: number }> {
     const [config] = configPda(this.programId);
+    const marketId = await this.nextMarketId();
     const a = deriveMarketAccounts(marketId, this.programId);
-    return this.program.methods
-      .createMarket(question, resolutionSource, resolutionTime, resolver)
+    const ix = await this.program.methods
+      .createMarket(
+        params.question,
+        params.resolutionSource,
+        params.closeTime,
+        params.resolutionTime,
+        params.resolver,
+        params.resolverKind ?? 0
+      )
       .accountsPartial({
         config,
         market: a.market,
@@ -104,14 +127,17 @@ export class ComputeClient {
         rent: SYSVAR_RENT_PUBKEY,
       })
       .instruction();
+    return { ix, marketId };
   }
 
   async seedLiquidityIx(lp: PublicKey, marketId: number | BN, amount: BN, collateralMint: PublicKey) {
+    const [config] = configPda(this.programId);
     const a = deriveMarketAccounts(marketId, this.programId);
     const lpCollateral = getAssociatedTokenAddressSync(collateralMint, lp);
     return this.program.methods
       .seedLiquidity(amount)
       .accountsPartial({
+        config,
         market: a.market,
         yesMint: a.yesMint,
         noMint: a.noMint,
@@ -127,7 +153,26 @@ export class ComputeClient {
       .instruction();
   }
 
-  /** Returns [createAtaIx (idempotent), tradeIx] so the outcome ATA always exists. */
+  // ----- trading -----
+
+  private tradeAccounts(user: PublicKey, marketId: number | BN, outMint: PublicKey, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    return {
+      config: configPda(this.programId)[0],
+      market: a.market,
+      yesMint: a.yesMint,
+      noMint: a.noMint,
+      poolYes: a.poolYes,
+      poolNo: a.poolNo,
+      vault: a.vault,
+      userOutcome: getAssociatedTokenAddressSync(outMint, user),
+      userCollateral: getAssociatedTokenAddressSync(collateralMint, user),
+      user,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    };
+  }
+
+  /** Returns [createAtaIx (idempotent), buyIx] so the outcome ATA always exists. */
   async buyIxs(
     user: PublicKey,
     marketId: number | BN,
@@ -138,24 +183,15 @@ export class ComputeClient {
   ): Promise<TransactionInstruction[]> {
     const a = deriveMarketAccounts(marketId, this.programId);
     const outMint = outcome === OUTCOME_YES ? a.yesMint : a.noMint;
-    const userOutcome = getAssociatedTokenAddressSync(outMint, user);
-    const userCollateral = getAssociatedTokenAddressSync(collateralMint, user);
-    const ataIx = createAssociatedTokenAccountIdempotentInstruction(user, userOutcome, user, outMint);
+    const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+      user,
+      getAssociatedTokenAddressSync(outMint, user),
+      user,
+      outMint
+    );
     const tradeIx = await this.program.methods
       .buy(outcome, collateralIn, minTokensOut)
-      .accountsPartial({
-        config: configPda(this.programId)[0],
-        market: a.market,
-        yesMint: a.yesMint,
-        noMint: a.noMint,
-        poolYes: a.poolYes,
-        poolNo: a.poolNo,
-        vault: a.vault,
-        userOutcome,
-        userCollateral,
-        user,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
+      .accountsPartial(this.tradeAccounts(user, marketId, outMint, collateralMint))
       .instruction();
     return [ataIx, tradeIx];
   }
@@ -170,68 +206,89 @@ export class ComputeClient {
   ) {
     const a = deriveMarketAccounts(marketId, this.programId);
     const outMint = outcome === OUTCOME_YES ? a.yesMint : a.noMint;
-    const userOutcome = getAssociatedTokenAddressSync(outMint, user);
-    const userCollateral = getAssociatedTokenAddressSync(collateralMint, user);
     return this.program.methods
       .sell(outcome, collateralOut, maxTokensIn)
-      .accountsPartial({
-        config: configPda(this.programId)[0],
-        market: a.market,
-        yesMint: a.yesMint,
-        noMint: a.noMint,
-        poolYes: a.poolYes,
-        poolNo: a.poolNo,
-        vault: a.vault,
-        userOutcome,
-        userCollateral,
-        user,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
+      .accountsPartial(this.tradeAccounts(user, marketId, outMint, collateralMint))
       .instruction();
   }
 
-  async resolveIx(resolver: PublicKey, marketId: number | BN, outcome: number) {
+  // ----- resolution -----
+
+  async proposeOutcomeIx(resolver: PublicKey, marketId: number | BN, outcome: number) {
     const a = deriveMarketAccounts(marketId, this.programId);
     return this.program.methods
-      .resolve(outcome)
+      .proposeOutcome(outcome)
       .accountsPartial({ market: a.market, resolver })
       .instruction();
   }
 
-  async redeemIx(
-    user: PublicKey,
-    marketId: number | BN,
-    winningOutcome: number,
-    amount: BN,
-    collateralMint: PublicKey
-  ) {
+  async finalizeOutcomeIx(cranker: PublicKey, marketId: number | BN) {
     const a = deriveMarketAccounts(marketId, this.programId);
-    const winningMint = winningOutcome === OUTCOME_YES ? a.yesMint : a.noMint;
-    const userOutcome = getAssociatedTokenAddressSync(winningMint, user);
-    const userCollateral = getAssociatedTokenAddressSync(collateralMint, user);
     return this.program.methods
-      .redeem(amount)
-      .accountsPartial({
-        market: a.market,
-        winningMint,
-        vault: a.vault,
-        userOutcome,
-        userCollateral,
-        user,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
+      .finalizeOutcome()
+      .accountsPartial({ config: configPda(this.programId)[0], market: a.market, cranker })
       .instruction();
   }
 
-  async claimPoolIx(lp: PublicKey, marketId: number | BN, winningOutcome: number, collateralMint: PublicKey) {
+  async disputeVoidIx(guardian: PublicKey, marketId: number | BN) {
     const a = deriveMarketAccounts(marketId, this.programId);
-    const winningMint = winningOutcome === OUTCOME_YES ? a.yesMint : a.noMint;
+    return this.program.methods
+      .disputeVoid()
+      .accountsPartial({ config: configPda(this.programId)[0], market: a.market, guardian })
+      .instruction();
+  }
+
+  async voidStaleIx(cranker: PublicKey, marketId: number | BN) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    return this.program.methods
+      .voidStale()
+      .accountsPartial({ market: a.market, cranker })
+      .instruction();
+  }
+
+  // ----- redemption -----
+
+  private redeemAccounts(user: PublicKey, marketId: number | BN, mint: PublicKey, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    return {
+      market: a.market,
+      winningMint: mint,
+      vault: a.vault,
+      userOutcome: getAssociatedTokenAddressSync(mint, user),
+      userCollateral: getAssociatedTokenAddressSync(collateralMint, user),
+      user,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    };
+  }
+
+  async redeemIx(user: PublicKey, marketId: number | BN, winningOutcome: number, amount: BN, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const mint = winningOutcome === OUTCOME_YES ? a.yesMint : a.noMint;
+    return this.program.methods
+      .redeem(amount)
+      .accountsPartial(this.redeemAccounts(user, marketId, mint, collateralMint))
+      .instruction();
+  }
+
+  /** Redeem either side of a voided market for half collateral per token. */
+  async redeemVoidIx(user: PublicKey, marketId: number | BN, side: number, amount: BN, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const mint = side === OUTCOME_YES ? a.yesMint : a.noMint;
+    return this.program.methods
+      .redeemVoid(amount)
+      .accountsPartial(this.redeemAccounts(user, marketId, mint, collateralMint))
+      .instruction();
+  }
+
+  async claimPoolIx(lp: PublicKey, marketId: number | BN, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
     const lpCollateral = getAssociatedTokenAddressSync(collateralMint, lp);
     return this.program.methods
       .claimPool()
       .accountsPartial({
         market: a.market,
-        winningMint,
+        yesMint: a.yesMint,
+        noMint: a.noMint,
         poolYes: a.poolYes,
         poolNo: a.poolNo,
         vault: a.vault,
@@ -248,16 +305,51 @@ export class ComputeClient {
     const adminCollateral = getAssociatedTokenAddressSync(collateralMint, admin);
     return this.program.methods
       .collectFees()
-      .accountsPartial({
-        config,
-        market: a.market,
-        vault: a.vault,
-        adminCollateral,
-        admin,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
+      .accountsPartial({ config, market: a.market, vault: a.vault, adminCollateral, admin, tokenProgram: TOKEN_PROGRAM_ID })
       .instruction();
   }
-}
 
-export { OUTCOME_YES, OUTCOME_NO };
+  // ----- admin / guardian -----
+
+  async setPausedIx(authority: PublicKey, paused: boolean) {
+    return this.program.methods
+      .setPaused(paused)
+      .accountsPartial({ config: configPda(this.programId)[0], authority })
+      .instruction();
+  }
+
+  async setFeeBpsIx(admin: PublicKey, feeBps: number) {
+    return this.program.methods
+      .setFeeBps(feeBps)
+      .accountsPartial({ config: configPda(this.programId)[0], admin })
+      .instruction();
+  }
+
+  async setGuardianIx(admin: PublicKey, guardian: PublicKey) {
+    return this.program.methods
+      .setGuardian(guardian)
+      .accountsPartial({ config: configPda(this.programId)[0], admin })
+      .instruction();
+  }
+
+  async setAdminIx(admin: PublicKey, newAdmin: PublicKey) {
+    return this.program.methods
+      .setAdmin(newAdmin)
+      .accountsPartial({ config: configPda(this.programId)[0], admin })
+      .instruction();
+  }
+
+  async acceptAdminIx(pendingAdmin: PublicKey) {
+    return this.program.methods
+      .acceptAdmin()
+      .accountsPartial({ config: configPda(this.programId)[0], pendingAdmin })
+      .instruction();
+  }
+
+  /** Decode an Anchor program error into a readable message, if possible. */
+  parseError(err: unknown): string {
+    const anchorErr = anchor.AnchorError.parse((err as any)?.logs ?? []);
+    if (anchorErr) return `${anchorErr.error.errorCode.code}: ${anchorErr.error.errorMessage}`;
+    return (err as any)?.message ?? String(err);
+  }
+}

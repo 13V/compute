@@ -2,7 +2,13 @@
   "name": "compute-markets-workspace",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "Compute — on-chain prediction markets for trading on compute (Solana/Anchor)",
+  "engines": {
+    "node": ">=22 <23",
+    "npm": ">=10"
+  },
+  "packageManager": "npm@10.9.7",
   "scripts": {
     "test": "bash scripts/test-integration.sh",
     "test:integration": "bash scripts/test-integration.sh",

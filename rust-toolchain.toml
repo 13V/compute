@@ -1,0 +1,8 @@
+# Pin the host Rust toolchain used for fmt/clippy/unit-tests in CI and locally.
+# This is the *host* toolchain (cargo test --lib, clippy, fmt). The on-chain
+# SBF build uses Anza/Agave platform-tools' own pinned rustc (v1.53 / 1.89.0-sbpf),
+# which is independent of this channel.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
