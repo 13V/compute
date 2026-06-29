@@ -140,12 +140,18 @@ pub mod compute_markets {
         resolver: Pubkey,
         resolver_kind: u8,
     ) -> Result<()> {
-        require!(question.len() <= Market::MAX_QUESTION, ErrorCode::StringTooLong);
+        require!(
+            question.len() <= Market::MAX_QUESTION,
+            ErrorCode::StringTooLong
+        );
         require!(
             resolution_source.len() <= Market::MAX_SOURCE,
             ErrorCode::StringTooLong
         );
-        require!(resolver_kind == RESOLVER_TRUSTED_KEY, ErrorCode::UnsupportedResolverKind);
+        require!(
+            resolver_kind == RESOLVER_TRUSTED_KEY,
+            ErrorCode::UnsupportedResolverKind
+        );
         require!(resolver != Pubkey::default(), ErrorCode::InvalidParameter);
 
         let now = Clock::get()?.unix_timestamp;
@@ -205,8 +211,14 @@ pub mod compute_markets {
         require!(!ctx.accounts.config.paused, ErrorCode::Paused);
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
-        require!(ctx.accounts.lp.key() == market.creator, ErrorCode::Unauthorized);
-        require!(market.reserve_yes == 0 && market.reserve_no == 0, ErrorCode::AlreadySeeded);
+        require!(
+            ctx.accounts.lp.key() == market.creator,
+            ErrorCode::Unauthorized
+        );
+        require!(
+            market.reserve_yes == 0 && market.reserve_no == 0,
+            ErrorCode::AlreadySeeded
+        );
         require!(amount > 0, ErrorCode::ZeroAmount);
 
         market.pool_yes = ctx.accounts.pool_yes.key();
@@ -258,7 +270,10 @@ pub mod compute_markets {
             amount,
         )?;
 
-        emit!(LiquiditySeeded { market: market.key(), amount });
+        emit!(LiquiditySeeded {
+            market: market.key(),
+            amount
+        });
         Ok(())
     }
 
@@ -276,20 +291,41 @@ pub mod compute_markets {
 
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
-        require!(Clock::get()?.unix_timestamp < market.close_time, ErrorCode::MarketClosed);
-        require!(market.reserve_yes > 0 && market.reserve_no > 0, ErrorCode::NoLiquidity);
+        require!(
+            Clock::get()?.unix_timestamp < market.close_time,
+            ErrorCode::MarketClosed
+        );
+        require!(
+            market.reserve_yes > 0 && market.reserve_no > 0,
+            ErrorCode::NoLiquidity
+        );
 
         let bought_mint = market.outcome_mint(side);
-        require_keys_eq!(ctx.accounts.user_outcome.mint, bought_mint, ErrorCode::WrongMint);
-        require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
+        require_keys_eq!(
+            ctx.accounts.user_outcome.mint,
+            bought_mint,
+            ErrorCode::WrongMint
+        );
+        require_keys_eq!(
+            ctx.accounts.user_outcome.owner,
+            ctx.accounts.user.key(),
+            ErrorCode::WrongOwner
+        );
 
-        let fee = math::fee_amount(collateral_in, ctx.accounts.config.fee_bps).ok_or(ErrorCode::MathOverflow)?;
-        let a = collateral_in.checked_sub(fee).ok_or(ErrorCode::MathOverflow)?;
+        let fee = math::fee_amount(collateral_in, ctx.accounts.config.fee_bps)
+            .ok_or(ErrorCode::MathOverflow)?;
+        let a = collateral_in
+            .checked_sub(fee)
+            .ok_or(ErrorCode::MathOverflow)?;
         require!(a > 0, ErrorCode::ZeroAmount);
 
         let (reserve_bought, reserve_other) = market.reserves(side);
-        let quote = math::quote_buy(reserve_bought, reserve_other, a).ok_or(ErrorCode::MathOverflow)?;
-        require!(quote.tokens_out >= min_tokens_out, ErrorCode::SlippageExceeded);
+        let quote =
+            math::quote_buy(reserve_bought, reserve_other, a).ok_or(ErrorCode::MathOverflow)?;
+        require!(
+            quote.tokens_out >= min_tokens_out,
+            ErrorCode::SlippageExceeded
+        );
         require!(quote.tokens_out > 0, ErrorCode::ZeroAmount);
 
         token::transfer(
@@ -353,8 +389,14 @@ pub mod compute_markets {
         )?;
 
         market.set_reserves(side, quote.new_reserve_bought, quote.new_reserve_other);
-        market.collateral = market.collateral.checked_add(a).ok_or(ErrorCode::MathOverflow)?;
-        market.fee_accrued = market.fee_accrued.checked_add(fee).ok_or(ErrorCode::MathOverflow)?;
+        market.collateral = market
+            .collateral
+            .checked_add(a)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.fee_accrued = market
+            .fee_accrued
+            .checked_add(fee)
+            .ok_or(ErrorCode::MathOverflow)?;
 
         emit!(TradeExecuted {
             market: market.key(),
@@ -381,21 +423,41 @@ pub mod compute_markets {
 
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
-        require!(Clock::get()?.unix_timestamp < market.close_time, ErrorCode::MarketClosed);
-        require!(collateral_out <= market.collateral, ErrorCode::InsufficientLiquidity);
+        require!(
+            Clock::get()?.unix_timestamp < market.close_time,
+            ErrorCode::MarketClosed
+        );
+        require!(
+            collateral_out <= market.collateral,
+            ErrorCode::InsufficientLiquidity
+        );
 
         let sold_mint = market.outcome_mint(side);
-        require_keys_eq!(ctx.accounts.user_outcome.mint, sold_mint, ErrorCode::WrongMint);
-        require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
+        require_keys_eq!(
+            ctx.accounts.user_outcome.mint,
+            sold_mint,
+            ErrorCode::WrongMint
+        );
+        require_keys_eq!(
+            ctx.accounts.user_outcome.owner,
+            ctx.accounts.user.key(),
+            ErrorCode::WrongOwner
+        );
 
         let (reserve_sold, reserve_other) = market.reserves(side);
         let quote = math::quote_sell(reserve_sold, reserve_other, collateral_out)
             .ok_or(ErrorCode::InsufficientLiquidity)?;
-        require!(quote.tokens_in <= max_tokens_in, ErrorCode::SlippageExceeded);
+        require!(
+            quote.tokens_in <= max_tokens_in,
+            ErrorCode::SlippageExceeded
+        );
         require!(quote.tokens_in > 0, ErrorCode::ZeroAmount);
 
-        let fee = math::fee_amount(collateral_out, ctx.accounts.config.fee_bps).ok_or(ErrorCode::MathOverflow)?;
-        let to_user = collateral_out.checked_sub(fee).ok_or(ErrorCode::MathOverflow)?;
+        let fee = math::fee_amount(collateral_out, ctx.accounts.config.fee_bps)
+            .ok_or(ErrorCode::MathOverflow)?;
+        let to_user = collateral_out
+            .checked_sub(fee)
+            .ok_or(ErrorCode::MathOverflow)?;
 
         let sold_pool = match side {
             Side::Yes => ctx.accounts.pool_yes.to_account_info(),
@@ -457,8 +519,14 @@ pub mod compute_markets {
         )?;
 
         market.set_reserves(side, quote.new_reserve_sold, quote.new_reserve_other);
-        market.collateral = market.collateral.checked_sub(collateral_out).ok_or(ErrorCode::MathOverflow)?;
-        market.fee_accrued = market.fee_accrued.checked_add(fee).ok_or(ErrorCode::MathOverflow)?;
+        market.collateral = market
+            .collateral
+            .checked_sub(collateral_out)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.fee_accrued = market
+            .fee_accrued
+            .checked_add(fee)
+            .ok_or(ErrorCode::MathOverflow)?;
 
         emit!(TradeExecuted {
             market: market.key(),
@@ -477,7 +545,10 @@ pub mod compute_markets {
         let _ = Side::from_u8(outcome)?;
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
-        require!(ctx.accounts.resolver.key() == market.resolver, ErrorCode::Unauthorized);
+        require!(
+            ctx.accounts.resolver.key() == market.resolver,
+            ErrorCode::Unauthorized
+        );
         let now = Clock::get()?.unix_timestamp;
         require!(now >= market.resolution_time, ErrorCode::TooEarlyToResolve);
 
@@ -502,7 +573,10 @@ pub mod compute_markets {
         require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
         let now = Clock::get()?.unix_timestamp;
         require!(
-            now >= market.resolved_at.checked_add(dispute_period).ok_or(ErrorCode::MathOverflow)?,
+            now >= market
+                .resolved_at
+                .checked_add(dispute_period)
+                .ok_or(ErrorCode::MathOverflow)?,
             ErrorCode::DisputeWindowOpen
         );
 
@@ -529,12 +603,18 @@ pub mod compute_markets {
         require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
         let now = Clock::get()?.unix_timestamp;
         require!(
-            now < market.resolved_at.checked_add(dispute_period).ok_or(ErrorCode::MathOverflow)?,
+            now < market
+                .resolved_at
+                .checked_add(dispute_period)
+                .ok_or(ErrorCode::MathOverflow)?,
             ErrorCode::DisputeWindowClosed
         );
 
         market.state = STATE_VOID;
-        emit!(MarketVoided { market: market.key(), reason: VOID_REASON_DISPUTE });
+        emit!(MarketVoided {
+            market: market.key(),
+            reason: VOID_REASON_DISPUTE
+        });
         Ok(())
     }
 
@@ -545,12 +625,18 @@ pub mod compute_markets {
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
         let now = Clock::get()?.unix_timestamp;
         require!(
-            now > market.resolution_time.checked_add(VOID_GRACE_PERIOD).ok_or(ErrorCode::MathOverflow)?,
+            now > market
+                .resolution_time
+                .checked_add(VOID_GRACE_PERIOD)
+                .ok_or(ErrorCode::MathOverflow)?,
             ErrorCode::TooEarlyToVoid
         );
 
         market.state = STATE_VOID;
-        emit!(MarketVoided { market: market.key(), reason: VOID_REASON_STALE });
+        emit!(MarketVoided {
+            market: market.key(),
+            reason: VOID_REASON_STALE
+        });
         Ok(())
     }
 
@@ -561,10 +647,25 @@ pub mod compute_markets {
         require!(market.state == STATE_RESOLVED, ErrorCode::NotResolved);
 
         let winning_mint = market.outcome_mint(Side::from_u8(market.outcome)?);
-        require_keys_eq!(ctx.accounts.winning_mint.key(), winning_mint, ErrorCode::WrongMint);
-        require_keys_eq!(ctx.accounts.user_outcome.mint, winning_mint, ErrorCode::WrongMint);
-        require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
-        require!(amount <= market.collateral, ErrorCode::InsufficientLiquidity);
+        require_keys_eq!(
+            ctx.accounts.winning_mint.key(),
+            winning_mint,
+            ErrorCode::WrongMint
+        );
+        require_keys_eq!(
+            ctx.accounts.user_outcome.mint,
+            winning_mint,
+            ErrorCode::WrongMint
+        );
+        require_keys_eq!(
+            ctx.accounts.user_outcome.owner,
+            ctx.accounts.user.key(),
+            ErrorCode::WrongOwner
+        );
+        require!(
+            amount <= market.collateral,
+            ErrorCode::InsufficientLiquidity
+        );
 
         token::burn(
             CpiContext::new(
@@ -595,7 +696,10 @@ pub mod compute_markets {
             amount,
         )?;
 
-        market.collateral = market.collateral.checked_sub(amount).ok_or(ErrorCode::MathOverflow)?;
+        market.collateral = market
+            .collateral
+            .checked_sub(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
         emit!(Redeemed {
             market: market.key(),
             user: ctx.accounts.user.key(),
@@ -618,10 +722,17 @@ pub mod compute_markets {
             ErrorCode::WrongMint
         );
         require_keys_eq!(ctx.accounts.user_outcome.mint, mint, ErrorCode::WrongMint);
-        require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
+        require_keys_eq!(
+            ctx.accounts.user_outcome.owner,
+            ctx.accounts.user.key(),
+            ErrorCode::WrongOwner
+        );
 
         let payout = amount / 2; // half of collateral per token
-        require!(payout <= market.collateral, ErrorCode::InsufficientLiquidity);
+        require!(
+            payout <= market.collateral,
+            ErrorCode::InsufficientLiquidity
+        );
 
         token::burn(
             CpiContext::new(
@@ -652,7 +763,10 @@ pub mod compute_markets {
                 ),
                 payout,
             )?;
-            market.collateral = market.collateral.checked_sub(payout).ok_or(ErrorCode::MathOverflow)?;
+            market.collateral = market
+                .collateral
+                .checked_sub(payout)
+                .ok_or(ErrorCode::MathOverflow)?;
         }
 
         emit!(Redeemed {
@@ -674,8 +788,16 @@ pub mod compute_markets {
             ErrorCode::NotResolved
         );
         require!(ctx.accounts.lp.key() == market.lp, ErrorCode::Unauthorized);
-        require_keys_eq!(ctx.accounts.yes_mint.key(), market.yes_mint, ErrorCode::WrongMint);
-        require_keys_eq!(ctx.accounts.no_mint.key(), market.no_mint, ErrorCode::WrongMint);
+        require_keys_eq!(
+            ctx.accounts.yes_mint.key(),
+            market.yes_mint,
+            ErrorCode::WrongMint
+        );
+        require_keys_eq!(
+            ctx.accounts.no_mint.key(),
+            market.no_mint,
+            ErrorCode::WrongMint
+        );
 
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
@@ -686,14 +808,26 @@ pub mod compute_markets {
             // Winning-side reserve redeems 1:1; the losing-side pool tokens are worthless.
             let side = Side::from_u8(market.outcome)?;
             let (winning_reserve, winning_pool, winning_mint) = match side {
-                Side::Yes => (market.reserve_yes, ctx.accounts.pool_yes.to_account_info(), ctx.accounts.yes_mint.to_account_info()),
-                Side::No => (market.reserve_no, ctx.accounts.pool_no.to_account_info(), ctx.accounts.no_mint.to_account_info()),
+                Side::Yes => (
+                    market.reserve_yes,
+                    ctx.accounts.pool_yes.to_account_info(),
+                    ctx.accounts.yes_mint.to_account_info(),
+                ),
+                Side::No => (
+                    market.reserve_no,
+                    ctx.accounts.pool_no.to_account_info(),
+                    ctx.accounts.no_mint.to_account_info(),
+                ),
             };
             require!(winning_reserve > 0, ErrorCode::NothingToClaim);
             token::burn(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
-                    Burn { mint: winning_mint, from: winning_pool, authority: market.to_account_info() },
+                    Burn {
+                        mint: winning_mint,
+                        from: winning_pool,
+                        authority: market.to_account_info(),
+                    },
                     signer,
                 ),
                 winning_reserve,
@@ -710,7 +844,11 @@ pub mod compute_markets {
                 token::burn(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
-                        Burn { mint: ctx.accounts.yes_mint.to_account_info(), from: ctx.accounts.pool_yes.to_account_info(), authority: market.to_account_info() },
+                        Burn {
+                            mint: ctx.accounts.yes_mint.to_account_info(),
+                            from: ctx.accounts.pool_yes.to_account_info(),
+                            authority: market.to_account_info(),
+                        },
                         signer,
                     ),
                     ry,
@@ -720,7 +858,11 @@ pub mod compute_markets {
                 token::burn(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
-                        Burn { mint: ctx.accounts.no_mint.to_account_info(), from: ctx.accounts.pool_no.to_account_info(), authority: market.to_account_info() },
+                        Burn {
+                            mint: ctx.accounts.no_mint.to_account_info(),
+                            from: ctx.accounts.pool_no.to_account_info(),
+                            authority: market.to_account_info(),
+                        },
                         signer,
                     ),
                     rn,
@@ -731,7 +873,10 @@ pub mod compute_markets {
             (ry / 2) + (rn / 2)
         };
 
-        require!(payout <= market.collateral, ErrorCode::InsufficientLiquidity);
+        require!(
+            payout <= market.collateral,
+            ErrorCode::InsufficientLiquidity
+        );
         if payout > 0 {
             token::transfer(
                 CpiContext::new_with_signer(
@@ -745,16 +890,26 @@ pub mod compute_markets {
                 ),
                 payout,
             )?;
-            market.collateral = market.collateral.checked_sub(payout).ok_or(ErrorCode::MathOverflow)?;
+            market.collateral = market
+                .collateral
+                .checked_sub(payout)
+                .ok_or(ErrorCode::MathOverflow)?;
         }
 
-        emit!(PoolClaimed { market: market.key(), lp: ctx.accounts.lp.key(), payout });
+        emit!(PoolClaimed {
+            market: market.key(),
+            lp: ctx.accounts.lp.key(),
+            payout
+        });
         Ok(())
     }
 
     /// Admin withdraws accrued protocol fees for this market.
     pub fn collect_fees(ctx: Context<CollectFees>) -> Result<()> {
-        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.config.admin,
+            ErrorCode::Unauthorized
+        );
         let market = &mut ctx.accounts.market;
         let amount = market.fee_accrued;
         require!(amount > 0, ErrorCode::NothingToClaim);
@@ -776,7 +931,10 @@ pub mod compute_markets {
             amount,
         )?;
         market.fee_accrued = 0;
-        emit!(FeesCollected { market: market.key(), amount });
+        emit!(FeesCollected {
+            market: market.key(),
+            amount
+        });
         Ok(())
     }
 
@@ -794,7 +952,10 @@ pub mod compute_markets {
 
     /// Update the taker fee (admin only), re-checked against `MAX_FEE_BPS`.
     pub fn set_fee_bps(ctx: Context<AdminOnly>, fee_bps: u16) -> Result<()> {
-        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.config.admin,
+            ErrorCode::Unauthorized
+        );
         require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
         ctx.accounts.config.fee_bps = fee_bps;
         Ok(())
@@ -802,14 +963,20 @@ pub mod compute_markets {
 
     /// Update the guardian (admin only).
     pub fn set_guardian(ctx: Context<AdminOnly>, guardian: Pubkey) -> Result<()> {
-        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.config.admin,
+            ErrorCode::Unauthorized
+        );
         ctx.accounts.config.guardian = guardian;
         Ok(())
     }
 
     /// Two-step admin transfer, step 1: nominate a new admin.
     pub fn set_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
-        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.config.admin,
+            ErrorCode::Unauthorized
+        );
         ctx.accounts.config.pending_admin = new_admin;
         Ok(())
     }

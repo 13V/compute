@@ -22,3 +22,14 @@ anchor-spl = "0.31.1"
 
 [dev-dependencies]
 proptest = "1"
+
+[lints.rust]
+# Anchor's `#[program]` / `#[derive(Accounts)]` macros emit cfg checks for
+# features they define internally (anchor-debug, custom-heap, custom-panic,
+# solana). They are not part of this crate's surface, so silence the
+# unexpected-cfg lint rather than letting `clippy -D warnings` fail on macro output.
+unexpected_cfgs = "allow"
+# The `#[program]` macro expands to a call to the now-deprecated
+# `AccountInfo::realloc` (Anchor 0.31 vs Agave 4.0). It is macro-generated, not
+# our code, so don't let the deprecation fail the lint gate.
+deprecated = "allow"

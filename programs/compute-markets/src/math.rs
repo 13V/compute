@@ -40,7 +40,7 @@ pub const BPS_DENOMINATOR: u64 = 10_000;
 /// ensure `b > 0`.
 #[inline]
 fn ceil_div(a: u128, b: u128) -> u128 {
-    a / b + if a % b != 0 { 1 } else { 0 }
+    a / b + if a.is_multiple_of(b) { 0 } else { 1 }
 }
 
 /// Result of a buy quote.
@@ -167,7 +167,9 @@ pub fn marginal_price_micro(reserve_self: u64, reserve_other: u64) -> Option<u64
     if total == 0 {
         return None;
     }
-    let price = (reserve_other as u128).checked_mul(1_000_000)?.checked_div(total)?;
+    let price = (reserve_other as u128)
+        .checked_mul(1_000_000)?
+        .checked_div(total)?;
     u64::try_from(price).ok()
 }
 
@@ -217,7 +219,7 @@ mod tests {
         let (ry, rn) = (5_000_000u64, 5_000_000u64);
         let a = 500_000u64;
         let buy = quote_buy(ry, rn, a).unwrap(); // buy YES
-        // Now sell `a` collateral worth back out of the new pool.
+                                                 // Now sell `a` collateral worth back out of the new pool.
         let sell = quote_sell(buy.new_reserve_bought, buy.new_reserve_other, a).unwrap();
         assert!(
             sell.tokens_in >= buy.tokens_out,
@@ -260,7 +262,12 @@ mod tests {
         // Buy YES -> YES reserve falls, YES price rises.
         let q = quote_buy(ry, rn, 400_000).unwrap();
         let p1 = marginal_price_micro(q.new_reserve_bought, q.new_reserve_other).unwrap();
-        assert!(p1 > p0, "yes price should rise after buying yes: {} -> {}", p0, p1);
+        assert!(
+            p1 > p0,
+            "yes price should rise after buying yes: {} -> {}",
+            p0,
+            p1
+        );
     }
 
     #[test]
