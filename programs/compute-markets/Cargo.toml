@@ -1,0 +1,24 @@
+[package]
+name = "compute-markets"
+version = "0.1.0"
+description = "Compute — on-chain prediction markets for trading on compute (FPMM)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "compute_markets"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"
+
+[dev-dependencies]
+proptest = "1"

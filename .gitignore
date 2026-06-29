@@ -1,0 +1,18 @@
+# Rust / Anchor
+/target
+**/*.rs.bk
+# Node
+node_modules
+.yarn
+# Next.js
+app/.next
+app/out
+app/node_modules
+# Solana
+test-ledger
+.anchor
+# Env / secrets
+.env
+.env.local
+*.local
+# Keep the program keypair out of git history? It is a throwaway localnet key.
