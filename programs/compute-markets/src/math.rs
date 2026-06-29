@@ -35,11 +35,12 @@ pub const DECIMALS: u8 = 6;
 /// Basis-points denominator.
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
-/// Ceiling division for u128. Returns `ceil(a / b)`. Panics never (callers ensure b > 0).
+/// Ceiling division for u128. Returns `ceil(a / b)`. Overflow-proof: computed as
+/// `a / b + (a % b != 0)` so it never forms the `a + b - 1` intermediate. Callers
+/// ensure `b > 0`.
 #[inline]
 fn ceil_div(a: u128, b: u128) -> u128 {
-    // b is always > 0 at call sites.
-    (a + b - 1) / b
+    a / b + if a % b != 0 { 1 } else { 0 }
 }
 
 /// Result of a buy quote.
@@ -282,36 +283,70 @@ mod tests {
 
     use proptest::prelude::*;
 
+    // Reserves are SPL u64 token balances; outcome tokens at 6 decimals reach
+    // ~1.8e13 for 18M tokens, but exercise much further toward the u64 envelope
+    // (~9.2e18) so the u128 intermediates are stressed. The product of two such
+    // reserves approaches ~8.5e37, still inside u128 (~3.4e38).
+    const RMAX: u64 = 3_000_000_000_000_000_000; // 3e18
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2000))]
+        #![proptest_config(ProptestConfig::with_cases(4000))]
 
         #[test]
-        fn prop_buy_never_decreases_k(
-            ry in 1_000u64..1_000_000_000_000u64,
-            rn in 1_000u64..1_000_000_000_000u64,
-            a in 0u64..1_000_000_000_000u64,
+        fn prop_buy_invariants(
+            rb in 1u64..RMAX,
+            ro in 1u64..RMAX,
+            a in 0u64..RMAX,
         ) {
-            if let Some(q) = quote_buy(ry, rn, a) {
-                let k0 = product(ry, rn);
-                let k1 = product(q.new_reserve_bought, q.new_reserve_other);
-                prop_assert!(k1 >= k0);
-                // Trader gets at least `a` tokens (marginal price <= 1).
+            if let Some(q) = quote_buy(rb, ro, a) {
+                // 1. Constant product never decreases (no value leaks from the pool).
+                prop_assert!(product(q.new_reserve_bought, q.new_reserve_other) >= product(rb, ro));
+                // 2. No-underflow: the retained reserve `keep` never exceeds rb+a.
+                prop_assert!(q.new_reserve_bought as u128 <= rb as u128 + a as u128);
+                // 3. Marginal price <= 1: trader receives at least `a` tokens.
                 prop_assert!(q.tokens_out >= a);
+                // 4. Other reserve grows by exactly `a` (full set minted in).
+                prop_assert_eq!(q.new_reserve_other as u128, ro as u128 + a as u128);
+                // 5. Token accounting closes: bought reserve = rb + a - tokens_out.
+                prop_assert_eq!(q.new_reserve_bought as u128, rb as u128 + a as u128 - q.tokens_out as u128);
+                // 6. Ceil-tightness: `keep` is the smallest value preserving the product.
+                let keep = q.new_reserve_bought as u128;
+                let denom = ro as u128 + a as u128;
+                if keep > 0 {
+                    prop_assert!((keep - 1) * denom < product(rb, ro));
+                }
             }
         }
 
         #[test]
-        fn prop_sell_never_decreases_k(
-            rs in 1_000u64..1_000_000_000_000u64,
-            rn in 1_000u64..1_000_000_000_000u64,
-            a in 0u64..1_000_000_000_000u64,
+        fn prop_sell_invariants(
+            rs in 1u64..RMAX,
+            ro in 2u64..RMAX,
+            a in 0u64..RMAX,
         ) {
-            if let Some(q) = quote_sell(rs, rn, a) {
-                let k0 = product(rs, rn);
-                let k1 = product(q.new_reserve_sold, q.new_reserve_other);
-                prop_assert!(k1 >= k0);
-                // Trader pays at least `a` tokens (marginal price <= 1).
+            if let Some(q) = quote_sell(rs, ro, a) {
+                prop_assert!(product(q.new_reserve_sold, q.new_reserve_other) >= product(rs, ro));
+                // No-underflow: required reserve `need` is at least rs.
+                prop_assert!(q.new_reserve_sold >= rs);
                 prop_assert!(q.tokens_in >= a);
+                prop_assert_eq!(q.new_reserve_other as u128, ro as u128 - a as u128);
+                prop_assert_eq!(q.new_reserve_sold as u128, rs as u128 + q.tokens_in as u128 - a as u128);
+            }
+        }
+
+        // Buy then immediately sell the same collateral back out of the resulting
+        // pool: the trader can never extract more tokens than they received (no
+        // free money), across the full reserve envelope.
+        #[test]
+        fn prop_round_trip_not_profitable(
+            ry in 1_000u64..RMAX,
+            rn in 1_000u64..RMAX,
+            a in 1u64..1_000_000_000_000u64,
+        ) {
+            if let Some(buy) = quote_buy(ry, rn, a) {
+                if let Some(sell) = quote_sell(buy.new_reserve_bought, buy.new_reserve_other, a) {
+                    prop_assert!(sell.tokens_in >= buy.tokens_out);
+                }
             }
         }
     }

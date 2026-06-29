@@ -8,16 +8,32 @@
 //! token chosen at `initialize` time (USDC in production). The economically
 //! load-bearing arithmetic lives in [`math`] and is unit-tested on the host.
 //!
-//! Lifecycle: `initialize` → `create_market` → `seed_liquidity` → `buy`/`sell`
-//! (trading) → `resolve` → `redeem` (+ `claim_pool`, `collect_fees`).
+//! ## Lifecycle
+//!
+//! `initialize` → `create_market` → `seed_liquidity` → `buy`/`sell` (until
+//! `close_time`) → `propose_outcome` → `finalize_outcome` (after the dispute
+//! window) → `redeem` / `claim_pool` / `collect_fees`.
+//!
+//! Settlement is deliberately defended in depth, because a manual resolver is a
+//! trusted component:
+//! * **Two-step resolution.** The resolver only *proposes* an outcome; payouts
+//!   unlock after a configurable `dispute_period`, giving a guardian time to veto.
+//! * **Guardian veto.** During the dispute window the guardian can `dispute_void`
+//!   a bad proposal, sending the market to a 50/50 refund.
+//! * **Liveness escape hatch.** If the resolver never proposes, anyone may
+//!   `void_stale` the market after a grace period so collateral is never stranded.
+//! * **Pause switch.** The admin or guardian can pause trading in an incident.
+//!
+//! `resolver_kind` + a reserved padding region make room for pluggable oracle
+//! resolvers (Switchboard / Pyth / optimistic) without a layout-breaking change;
+//! only `TRUSTED_KEY` is wired today.
 //!
 //! ## Conservation invariant
 //!
-//! At all times the collateral vault balance equals
-//! `market.collateral` (backing every outstanding full set) `+ market.fee_accrued`.
-//! Every YES in existence is matched 1:1 by a NO (both are minted/burned only as
-//! full sets), so after resolution the winning-side supply exactly equals
-//! `market.collateral`, and redemptions drain the vault to the accrued fees.
+//! At all times `vault == market.collateral + market.fee_accrued`. Every YES is
+//! matched 1:1 by a NO (minted/burned only as full sets), so on a YES/NO
+//! resolution the winning-side supply equals `market.collateral`; on a void each
+//! outcome token is worth exactly half of collateral, which also conserves.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
@@ -31,10 +47,26 @@ pub const OUTCOME_YES: u8 = 0;
 /// NO outcome index.
 pub const OUTCOME_NO: u8 = 1;
 
-/// Market is open for trading.
+/// Open for trading.
 pub const STATE_OPEN: u8 = 0;
-/// Market has been resolved; redemptions are enabled.
-pub const STATE_RESOLVED: u8 = 1;
+/// An outcome has been proposed and is in the dispute window.
+pub const STATE_RESOLVING: u8 = 1;
+/// Finalized to a YES/NO outcome; winning tokens redeem 1:1.
+pub const STATE_RESOLVED: u8 = 2;
+/// Voided/invalid; every outcome token redeems for half of collateral.
+pub const STATE_VOID: u8 = 3;
+
+/// Trusted single-key resolver (the only resolver kind wired today).
+pub const RESOLVER_TRUSTED_KEY: u8 = 0;
+
+/// Maximum protocol fee (10%).
+pub const MAX_FEE_BPS: u16 = 1_000;
+/// Maximum dispute period (30 days) — a sanity bound on the timelock.
+pub const MAX_DISPUTE_PERIOD: i64 = 30 * 24 * 60 * 60;
+/// Maximum market horizon from creation (~2 years) — bounds `resolution_time`.
+pub const MAX_MARKET_HORIZON: i64 = 2 * 366 * 24 * 60 * 60;
+/// Grace period after `resolution_time` before anyone may void a stale market (7 days).
+pub const VOID_GRACE_PERIOD: i64 = 7 * 24 * 60 * 60;
 
 pub const MARKET_SEED: &[u8] = b"market";
 pub const CONFIG_SEED: &[u8] = b"config";
@@ -44,37 +76,84 @@ pub const VAULT_SEED: &[u8] = b"vault";
 pub const POOL_YES_SEED: &[u8] = b"pool_yes";
 pub const POOL_NO_SEED: &[u8] = b"pool_no";
 
+/// One side of a binary market. Centralizes the YES/NO ↔ reserve mapping so the
+/// trade handlers never hand-mirror branches (a transposed branch would be a
+/// silent fund-routing bug).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Yes,
+    No,
+}
+
+impl Side {
+    pub fn from_u8(o: u8) -> Result<Self> {
+        match o {
+            OUTCOME_YES => Ok(Side::Yes),
+            OUTCOME_NO => Ok(Side::No),
+            _ => err!(ErrorCode::InvalidOutcome),
+        }
+    }
+}
+
 #[program]
 pub mod compute_markets {
     use super::*;
 
-    /// Initialize the global config (one per deployment). `fee_bps` is the taker
-    /// fee charged on `buy`/`sell` (e.g. 100 = 1%), capped at 10% (1000 bps).
-    pub fn initialize(ctx: Context<Initialize>, fee_bps: u16) -> Result<()> {
-        require!(fee_bps <= 1_000, ErrorCode::FeeTooHigh);
+    /// Initialize the global config (one per deployment).
+    ///
+    /// * `fee_bps` — taker fee on buy/sell (e.g. 100 = 1%), capped at `MAX_FEE_BPS`.
+    /// * `dispute_period` — seconds between a proposed outcome and payout unlock.
+    /// * `guardian` — key allowed to pause and to veto a proposed outcome.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        fee_bps: u16,
+        dispute_period: i64,
+        guardian: Pubkey,
+    ) -> Result<()> {
+        require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
+        require!(
+            (0..=MAX_DISPUTE_PERIOD).contains(&dispute_period),
+            ErrorCode::InvalidParameter
+        );
         let config = &mut ctx.accounts.config;
         config.admin = ctx.accounts.admin.key();
+        config.pending_admin = Pubkey::default();
+        config.guardian = guardian;
         config.collateral_mint = ctx.accounts.collateral_mint.key();
         config.fee_bps = fee_bps;
+        config.dispute_period = dispute_period;
         config.market_count = 0;
+        config.paused = false;
         config.bump = ctx.bumps.config;
         Ok(())
     }
 
     /// Create a new binary market. Permissionless: anyone may create one and
-    /// nominate a `resolver` (the trusted oracle key for this market). The market
-    /// id is the current `config.market_count`, which is then incremented.
+    /// nominate a `resolver`. Trading halts at `close_time`; the outcome may be
+    /// proposed at/after `resolution_time` (`close_time <= resolution_time`).
     pub fn create_market(
         ctx: Context<CreateMarket>,
         question: String,
         resolution_source: String,
+        close_time: i64,
         resolution_time: i64,
         resolver: Pubkey,
+        resolver_kind: u8,
     ) -> Result<()> {
         require!(question.len() <= Market::MAX_QUESTION, ErrorCode::StringTooLong);
         require!(
             resolution_source.len() <= Market::MAX_SOURCE,
             ErrorCode::StringTooLong
+        );
+        require!(resolver_kind == RESOLVER_TRUSTED_KEY, ErrorCode::UnsupportedResolverKind);
+        require!(resolver != Pubkey::default(), ErrorCode::InvalidParameter);
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(close_time <= resolution_time, ErrorCode::InvalidTimeWindow);
+        require!(resolution_time > now, ErrorCode::InvalidTimeWindow);
+        require!(
+            resolution_time <= now + MAX_MARKET_HORIZON,
+            ErrorCode::InvalidTimeWindow
         );
 
         let market_id = ctx.accounts.config.market_count;
@@ -82,6 +161,7 @@ pub mod compute_markets {
         market.market_id = market_id;
         market.creator = ctx.accounts.creator.key();
         market.resolver = resolver;
+        market.resolver_kind = resolver_kind;
         market.collateral_mint = ctx.accounts.collateral_mint.key();
         market.yes_mint = ctx.accounts.yes_mint.key();
         market.no_mint = ctx.accounts.no_mint.key();
@@ -96,36 +176,39 @@ pub mod compute_markets {
         market.fee_accrued = 0;
         market.state = STATE_OPEN;
         market.outcome = 0;
+        market.proposed_outcome = 0;
+        market.close_time = close_time;
         market.resolution_time = resolution_time;
+        market.resolved_at = 0;
         market.question = question;
         market.resolution_source = resolution_source;
+        market.reserved = [0u8; Market::RESERVED];
         market.bump = ctx.bumps.market;
 
-        ctx.accounts.config.market_count = market_id.checked_add(1).ok_or(ErrorCode::MathOverflow)?;
+        ctx.accounts.config.market_count =
+            market_id.checked_add(1).ok_or(ErrorCode::MathOverflow)?;
 
         emit!(MarketCreated {
             market_id,
             market: market.key(),
             creator: market.creator,
             resolver,
+            close_time,
+            resolution_time,
         });
         Ok(())
     }
 
     /// Seed the AMM with initial liquidity at 50/50 odds. Callable once, by the
-    /// market creator, before any trading. Mints `amount` of each outcome into
-    /// the pool and deposits `amount` collateral.
+    /// market creator, before any trading.
     pub fn seed_liquidity(ctx: Context<SeedLiquidity>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.config.paused, ErrorCode::Paused);
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
-        require!(
-            ctx.accounts.lp.key() == market.creator,
-            ErrorCode::Unauthorized
-        );
+        require!(ctx.accounts.lp.key() == market.creator, ErrorCode::Unauthorized);
         require!(market.reserve_yes == 0 && market.reserve_no == 0, ErrorCode::AlreadySeeded);
         require!(amount > 0, ErrorCode::ZeroAmount);
 
-        // Record pool accounts now that they exist.
         market.pool_yes = ctx.accounts.pool_yes.key();
         market.pool_no = ctx.accounts.pool_no.key();
         market.lp = ctx.accounts.lp.key();
@@ -134,7 +217,6 @@ pub mod compute_markets {
         market.reserve_no = amount;
         market.collateral = amount;
 
-        // Pull collateral from the LP into the vault.
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -147,7 +229,6 @@ pub mod compute_markets {
             amount,
         )?;
 
-        // Mint a full set into the pool.
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
@@ -177,50 +258,40 @@ pub mod compute_markets {
             amount,
         )?;
 
-        emit!(LiquiditySeeded {
-            market: market.key(),
-            amount,
-        });
+        emit!(LiquiditySeeded { market: market.key(), amount });
         Ok(())
     }
 
-    /// Buy `outcome` (YES=0/NO=1) by investing `collateral_in`. A taker fee is
-    /// deducted, a full set is minted into the pool, and the constant-product
-    /// swap returns outcome tokens to the trader. Reverts if fewer than
-    /// `min_tokens_out` would be received.
+    /// Buy `outcome` by investing `collateral_in`. Reverts if fewer than
+    /// `min_tokens_out` would be received, if paused, or after `close_time`.
     pub fn buy(
         ctx: Context<Trade>,
         outcome: u8,
         collateral_in: u64,
         min_tokens_out: u64,
     ) -> Result<()> {
-        require!(outcome == OUTCOME_YES || outcome == OUTCOME_NO, ErrorCode::InvalidOutcome);
+        let side = Side::from_u8(outcome)?;
+        require!(!ctx.accounts.config.paused, ErrorCode::Paused);
         require!(collateral_in > 0, ErrorCode::ZeroAmount);
 
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        require!(Clock::get()?.unix_timestamp < market.close_time, ErrorCode::MarketClosed);
         require!(market.reserve_yes > 0 && market.reserve_no > 0, ErrorCode::NoLiquidity);
 
-        // The user's outcome token account must be for the bought side and owned by them.
-        let bought_mint = if outcome == OUTCOME_YES { market.yes_mint } else { market.no_mint };
+        let bought_mint = market.outcome_mint(side);
         require_keys_eq!(ctx.accounts.user_outcome.mint, bought_mint, ErrorCode::WrongMint);
         require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
 
-        let fee = math::fee_amount(collateral_in, ctx.accounts.config.fee_bps)
-            .ok_or(ErrorCode::MathOverflow)?;
+        let fee = math::fee_amount(collateral_in, ctx.accounts.config.fee_bps).ok_or(ErrorCode::MathOverflow)?;
         let a = collateral_in.checked_sub(fee).ok_or(ErrorCode::MathOverflow)?;
         require!(a > 0, ErrorCode::ZeroAmount);
 
-        let (reserve_bought, reserve_other) = if outcome == OUTCOME_YES {
-            (market.reserve_yes, market.reserve_no)
-        } else {
-            (market.reserve_no, market.reserve_yes)
-        };
+        let (reserve_bought, reserve_other) = market.reserves(side);
         let quote = math::quote_buy(reserve_bought, reserve_other, a).ok_or(ErrorCode::MathOverflow)?;
         require!(quote.tokens_out >= min_tokens_out, ErrorCode::SlippageExceeded);
         require!(quote.tokens_out > 0, ErrorCode::ZeroAmount);
 
-        // Collateral in.
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -233,11 +304,11 @@ pub mod compute_markets {
             collateral_in,
         )?;
 
-        // Mint a full set into the pool.
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
         let signer: &[&[&[u8]]] = &[seeds];
+        // Mint a full set into the pool.
         token::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -264,10 +335,9 @@ pub mod compute_markets {
         )?;
 
         // Swap: deliver the bought side from its pool to the trader.
-        let bought_pool = if outcome == OUTCOME_YES {
-            ctx.accounts.pool_yes.to_account_info()
-        } else {
-            ctx.accounts.pool_no.to_account_info()
+        let bought_pool = match side {
+            Side::Yes => ctx.accounts.pool_yes.to_account_info(),
+            Side::No => ctx.accounts.pool_no.to_account_info(),
         };
         token::transfer(
             CpiContext::new_with_signer(
@@ -282,13 +352,7 @@ pub mod compute_markets {
             quote.tokens_out,
         )?;
 
-        if outcome == OUTCOME_YES {
-            market.reserve_yes = quote.new_reserve_bought;
-            market.reserve_no = quote.new_reserve_other;
-        } else {
-            market.reserve_no = quote.new_reserve_bought;
-            market.reserve_yes = quote.new_reserve_other;
-        }
+        market.set_reserves(side, quote.new_reserve_bought, quote.new_reserve_other);
         market.collateral = market.collateral.checked_add(a).ok_or(ErrorCode::MathOverflow)?;
         market.fee_accrued = market.fee_accrued.checked_add(fee).ok_or(ErrorCode::MathOverflow)?;
 
@@ -303,46 +367,39 @@ pub mod compute_markets {
         Ok(())
     }
 
-    /// Sell `outcome` to withdraw `collateral_out` of collateral (gross). The
-    /// trader returns outcome tokens to the pool, a full set is merged out, the
-    /// taker fee is deducted, and the remainder is paid to the trader. Reverts if
-    /// more than `max_tokens_in` outcome tokens would be required.
+    /// Sell `outcome` to withdraw `collateral_out` (gross). Reverts if more than
+    /// `max_tokens_in` would be required, if paused, or after `close_time`.
     pub fn sell(
         ctx: Context<Trade>,
         outcome: u8,
         collateral_out: u64,
         max_tokens_in: u64,
     ) -> Result<()> {
-        require!(outcome == OUTCOME_YES || outcome == OUTCOME_NO, ErrorCode::InvalidOutcome);
+        let side = Side::from_u8(outcome)?;
+        require!(!ctx.accounts.config.paused, ErrorCode::Paused);
         require!(collateral_out > 0, ErrorCode::ZeroAmount);
 
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        require!(Clock::get()?.unix_timestamp < market.close_time, ErrorCode::MarketClosed);
         require!(collateral_out <= market.collateral, ErrorCode::InsufficientLiquidity);
 
-        let sold_mint = if outcome == OUTCOME_YES { market.yes_mint } else { market.no_mint };
+        let sold_mint = market.outcome_mint(side);
         require_keys_eq!(ctx.accounts.user_outcome.mint, sold_mint, ErrorCode::WrongMint);
         require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
 
-        let (reserve_sold, reserve_other) = if outcome == OUTCOME_YES {
-            (market.reserve_yes, market.reserve_no)
-        } else {
-            (market.reserve_no, market.reserve_yes)
-        };
-        let quote =
-            math::quote_sell(reserve_sold, reserve_other, collateral_out).ok_or(ErrorCode::InsufficientLiquidity)?;
+        let (reserve_sold, reserve_other) = market.reserves(side);
+        let quote = math::quote_sell(reserve_sold, reserve_other, collateral_out)
+            .ok_or(ErrorCode::InsufficientLiquidity)?;
         require!(quote.tokens_in <= max_tokens_in, ErrorCode::SlippageExceeded);
         require!(quote.tokens_in > 0, ErrorCode::ZeroAmount);
 
-        let fee = math::fee_amount(collateral_out, ctx.accounts.config.fee_bps)
-            .ok_or(ErrorCode::MathOverflow)?;
+        let fee = math::fee_amount(collateral_out, ctx.accounts.config.fee_bps).ok_or(ErrorCode::MathOverflow)?;
         let to_user = collateral_out.checked_sub(fee).ok_or(ErrorCode::MathOverflow)?;
 
-        // Trader returns the sold outcome tokens into the pool.
-        let sold_pool = if outcome == OUTCOME_YES {
-            ctx.accounts.pool_yes.to_account_info()
-        } else {
-            ctx.accounts.pool_no.to_account_info()
+        let sold_pool = match side {
+            Side::Yes => ctx.accounts.pool_yes.to_account_info(),
+            Side::No => ctx.accounts.pool_no.to_account_info(),
         };
         token::transfer(
             CpiContext::new(
@@ -356,11 +413,11 @@ pub mod compute_markets {
             quote.tokens_in,
         )?;
 
-        // Merge a full set out of the pool (burn `collateral_out` of each side).
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
         let signer: &[&[&[u8]]] = &[seeds];
+        // Merge a full set out of the pool.
         token::burn(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -386,7 +443,6 @@ pub mod compute_markets {
             collateral_out,
         )?;
 
-        // Pay the trader (net of fee) from the vault.
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -400,13 +456,7 @@ pub mod compute_markets {
             to_user,
         )?;
 
-        if outcome == OUTCOME_YES {
-            market.reserve_yes = quote.new_reserve_sold;
-            market.reserve_no = quote.new_reserve_other;
-        } else {
-            market.reserve_no = quote.new_reserve_sold;
-            market.reserve_yes = quote.new_reserve_other;
-        }
+        market.set_reserves(side, quote.new_reserve_sold, quote.new_reserve_other);
         market.collateral = market.collateral.checked_sub(collateral_out).ok_or(ErrorCode::MathOverflow)?;
         market.fee_accrued = market.fee_accrued.checked_add(fee).ok_or(ErrorCode::MathOverflow)?;
 
@@ -421,23 +471,86 @@ pub mod compute_markets {
         Ok(())
     }
 
-    /// Resolve the market to a winning `outcome`. Only the market's `resolver`
-    /// may call, and only at/after `resolution_time`.
-    pub fn resolve(ctx: Context<Resolve>, outcome: u8) -> Result<()> {
-        require!(outcome == OUTCOME_YES || outcome == OUTCOME_NO, ErrorCode::InvalidOutcome);
+    /// Step 1 of resolution: the market's `resolver` proposes a winning outcome
+    /// at/after `resolution_time`. Opens the dispute window; payouts stay locked.
+    pub fn propose_outcome(ctx: Context<ProposeOutcome>, outcome: u8) -> Result<()> {
+        let _ = Side::from_u8(outcome)?;
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
         require!(ctx.accounts.resolver.key() == market.resolver, ErrorCode::Unauthorized);
         let now = Clock::get()?.unix_timestamp;
         require!(now >= market.resolution_time, ErrorCode::TooEarlyToResolve);
 
-        market.outcome = outcome;
+        market.state = STATE_RESOLVING;
+        market.proposed_outcome = outcome;
+        market.resolved_at = now;
+
+        emit!(OutcomeProposed {
+            market: market.key(),
+            resolver: ctx.accounts.resolver.key(),
+            outcome,
+            proposed_at: now,
+        });
+        Ok(())
+    }
+
+    /// Step 2 of resolution: finalize a proposed outcome once the dispute window
+    /// has elapsed. Permissionless — anyone may crank it.
+    pub fn finalize_outcome(ctx: Context<FinalizeOutcome>) -> Result<()> {
+        let dispute_period = ctx.accounts.config.dispute_period;
+        let market = &mut ctx.accounts.market;
+        require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= market.resolved_at.checked_add(dispute_period).ok_or(ErrorCode::MathOverflow)?,
+            ErrorCode::DisputeWindowOpen
+        );
+
         market.state = STATE_RESOLVED;
+        market.outcome = market.proposed_outcome;
 
         emit!(MarketResolved {
             market: market.key(),
-            outcome,
+            outcome: market.outcome,
+            resolved_at: now,
         });
+        Ok(())
+    }
+
+    /// Guardian veto: during the dispute window, void a proposed outcome (→ 50/50
+    /// refund). Use when a proposal is wrong or the resolver is compromised.
+    pub fn dispute_void(ctx: Context<GuardianAction>) -> Result<()> {
+        require!(
+            ctx.accounts.guardian.key() == ctx.accounts.config.guardian,
+            ErrorCode::Unauthorized
+        );
+        let dispute_period = ctx.accounts.config.dispute_period;
+        let market = &mut ctx.accounts.market;
+        require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now < market.resolved_at.checked_add(dispute_period).ok_or(ErrorCode::MathOverflow)?,
+            ErrorCode::DisputeWindowClosed
+        );
+
+        market.state = STATE_VOID;
+        emit!(MarketVoided { market: market.key(), reason: VOID_REASON_DISPUTE });
+        Ok(())
+    }
+
+    /// Liveness escape hatch: if the resolver never proposes, anyone may void a
+    /// stale market `VOID_GRACE_PERIOD` after `resolution_time`, freeing collateral.
+    pub fn void_stale(ctx: Context<VoidStale>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now > market.resolution_time.checked_add(VOID_GRACE_PERIOD).ok_or(ErrorCode::MathOverflow)?,
+            ErrorCode::TooEarlyToVoid
+        );
+
+        market.state = STATE_VOID;
+        emit!(MarketVoided { market: market.key(), reason: VOID_REASON_STALE });
         Ok(())
     }
 
@@ -447,13 +560,12 @@ pub mod compute_markets {
         let market = &mut ctx.accounts.market;
         require!(market.state == STATE_RESOLVED, ErrorCode::NotResolved);
 
-        let winning_mint = if market.outcome == OUTCOME_YES { market.yes_mint } else { market.no_mint };
+        let winning_mint = market.outcome_mint(Side::from_u8(market.outcome)?);
         require_keys_eq!(ctx.accounts.winning_mint.key(), winning_mint, ErrorCode::WrongMint);
         require_keys_eq!(ctx.accounts.user_outcome.mint, winning_mint, ErrorCode::WrongMint);
         require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
         require!(amount <= market.collateral, ErrorCode::InsufficientLiquidity);
 
-        // Burn the winning tokens.
         token::burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -466,7 +578,6 @@ pub mod compute_markets {
             amount,
         )?;
 
-        // Pay collateral 1:1.
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
@@ -485,61 +596,159 @@ pub mod compute_markets {
         )?;
 
         market.collateral = market.collateral.checked_sub(amount).ok_or(ErrorCode::MathOverflow)?;
+        emit!(Redeemed {
+            market: market.key(),
+            user: ctx.accounts.user.key(),
+            amount,
+            payout: amount,
+        });
         Ok(())
     }
 
-    /// After resolution, the LP claims the winning-side pool reserve as collateral.
+    /// Redeem `amount` of EITHER outcome token on a voided market for half of
+    /// collateral per token (rounded down). 50/50 refund that conserves the vault.
+    pub fn redeem_void(ctx: Context<Redeem>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+        let market = &mut ctx.accounts.market;
+        require!(market.state == STATE_VOID, ErrorCode::NotVoid);
+
+        let mint = ctx.accounts.winning_mint.key();
+        require!(
+            mint == market.yes_mint || mint == market.no_mint,
+            ErrorCode::WrongMint
+        );
+        require_keys_eq!(ctx.accounts.user_outcome.mint, mint, ErrorCode::WrongMint);
+        require_keys_eq!(ctx.accounts.user_outcome.owner, ctx.accounts.user.key(), ErrorCode::WrongOwner);
+
+        let payout = amount / 2; // half of collateral per token
+        require!(payout <= market.collateral, ErrorCode::InsufficientLiquidity);
+
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.winning_mint.to_account_info(),
+                    from: ctx.accounts.user_outcome.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+
+        if payout > 0 {
+            let id_bytes = market.market_id.to_le_bytes();
+            let bump_seed = [market.bump];
+            let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
+            let signer: &[&[&[u8]]] = &[seeds];
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault.to_account_info(),
+                        to: ctx.accounts.user_collateral.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                payout,
+            )?;
+            market.collateral = market.collateral.checked_sub(payout).ok_or(ErrorCode::MathOverflow)?;
+        }
+
+        emit!(Redeemed {
+            market: market.key(),
+            user: ctx.accounts.user.key(),
+            amount,
+            payout,
+        });
+        Ok(())
+    }
+
+    /// After settlement, the LP reclaims the pool's outcome tokens as collateral:
+    /// the winning-side reserve on a YES/NO resolution, or half of each reserve on
+    /// a void.
     pub fn claim_pool(ctx: Context<ClaimPool>) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        require!(market.state == STATE_RESOLVED, ErrorCode::NotResolved);
+        require!(
+            market.state == STATE_RESOLVED || market.state == STATE_VOID,
+            ErrorCode::NotResolved
+        );
         require!(ctx.accounts.lp.key() == market.lp, ErrorCode::Unauthorized);
-
-        let (winning_mint, winning_reserve, winning_pool) = if market.outcome == OUTCOME_YES {
-            (market.yes_mint, market.reserve_yes, ctx.accounts.pool_yes.to_account_info())
-        } else {
-            (market.no_mint, market.reserve_no, ctx.accounts.pool_no.to_account_info())
-        };
-        require_keys_eq!(ctx.accounts.winning_mint.key(), winning_mint, ErrorCode::WrongMint);
-        require!(winning_reserve > 0, ErrorCode::NothingToClaim);
-        require!(winning_reserve <= market.collateral, ErrorCode::InsufficientLiquidity);
+        require_keys_eq!(ctx.accounts.yes_mint.key(), market.yes_mint, ErrorCode::WrongMint);
+        require_keys_eq!(ctx.accounts.no_mint.key(), market.no_mint, ErrorCode::WrongMint);
 
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
         let signer: &[&[&[u8]]] = &[seeds];
-        // Burn the pool's winning tokens.
-        token::burn(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Burn {
-                    mint: ctx.accounts.winning_mint.to_account_info(),
-                    from: winning_pool,
-                    authority: market.to_account_info(),
-                },
-                signer,
-            ),
-            winning_reserve,
-        )?;
-        // Pay the LP.
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.vault.to_account_info(),
-                    to: ctx.accounts.lp_collateral.to_account_info(),
-                    authority: market.to_account_info(),
-                },
-                signer,
-            ),
-            winning_reserve,
-        )?;
 
-        market.collateral = market.collateral.checked_sub(winning_reserve).ok_or(ErrorCode::MathOverflow)?;
-        if market.outcome == OUTCOME_YES {
+        let payout: u64 = if market.state == STATE_RESOLVED {
+            // Winning-side reserve redeems 1:1; the losing-side pool tokens are worthless.
+            let side = Side::from_u8(market.outcome)?;
+            let (winning_reserve, winning_pool, winning_mint) = match side {
+                Side::Yes => (market.reserve_yes, ctx.accounts.pool_yes.to_account_info(), ctx.accounts.yes_mint.to_account_info()),
+                Side::No => (market.reserve_no, ctx.accounts.pool_no.to_account_info(), ctx.accounts.no_mint.to_account_info()),
+            };
+            require!(winning_reserve > 0, ErrorCode::NothingToClaim);
+            token::burn(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Burn { mint: winning_mint, from: winning_pool, authority: market.to_account_info() },
+                    signer,
+                ),
+                winning_reserve,
+            )?;
             market.reserve_yes = 0;
-        } else {
             market.reserve_no = 0;
+            winning_reserve
+        } else {
+            // Void: half of each reserve.
+            let ry = market.reserve_yes;
+            let rn = market.reserve_no;
+            require!(ry > 0 || rn > 0, ErrorCode::NothingToClaim);
+            if ry > 0 {
+                token::burn(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Burn { mint: ctx.accounts.yes_mint.to_account_info(), from: ctx.accounts.pool_yes.to_account_info(), authority: market.to_account_info() },
+                        signer,
+                    ),
+                    ry,
+                )?;
+            }
+            if rn > 0 {
+                token::burn(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Burn { mint: ctx.accounts.no_mint.to_account_info(), from: ctx.accounts.pool_no.to_account_info(), authority: market.to_account_info() },
+                        signer,
+                    ),
+                    rn,
+                )?;
+            }
+            market.reserve_yes = 0;
+            market.reserve_no = 0;
+            (ry / 2) + (rn / 2)
+        };
+
+        require!(payout <= market.collateral, ErrorCode::InsufficientLiquidity);
+        if payout > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault.to_account_info(),
+                        to: ctx.accounts.lp_collateral.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                payout,
+            )?;
+            market.collateral = market.collateral.checked_sub(payout).ok_or(ErrorCode::MathOverflow)?;
         }
+
+        emit!(PoolClaimed { market: market.key(), lp: ctx.accounts.lp.key(), payout });
         Ok(())
     }
 
@@ -567,23 +776,74 @@ pub mod compute_markets {
             amount,
         )?;
         market.fee_accrued = 0;
+        emit!(FeesCollected { market: market.key(), amount });
+        Ok(())
+    }
+
+    // ----- admin / guardian configuration -----
+
+    /// Pause or unpause all trading. Callable by the admin or the guardian.
+    pub fn set_paused(ctx: Context<AdminOrGuardian>, paused: bool) -> Result<()> {
+        let is_admin = ctx.accounts.authority.key() == ctx.accounts.config.admin;
+        let is_guardian = ctx.accounts.authority.key() == ctx.accounts.config.guardian;
+        require!(is_admin || is_guardian, ErrorCode::Unauthorized);
+        ctx.accounts.config.paused = paused;
+        emit!(PausedSet { paused });
+        Ok(())
+    }
+
+    /// Update the taker fee (admin only), re-checked against `MAX_FEE_BPS`.
+    pub fn set_fee_bps(ctx: Context<AdminOnly>, fee_bps: u16) -> Result<()> {
+        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
+        ctx.accounts.config.fee_bps = fee_bps;
+        Ok(())
+    }
+
+    /// Update the guardian (admin only).
+    pub fn set_guardian(ctx: Context<AdminOnly>, guardian: Pubkey) -> Result<()> {
+        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        ctx.accounts.config.guardian = guardian;
+        Ok(())
+    }
+
+    /// Two-step admin transfer, step 1: nominate a new admin.
+    pub fn set_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
+        require!(ctx.accounts.admin.key() == ctx.accounts.config.admin, ErrorCode::Unauthorized);
+        ctx.accounts.config.pending_admin = new_admin;
+        Ok(())
+    }
+
+    /// Two-step admin transfer, step 2: the nominee accepts.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        require!(
+            ctx.accounts.pending_admin.key() == ctx.accounts.config.pending_admin
+                && ctx.accounts.config.pending_admin != Pubkey::default(),
+            ErrorCode::Unauthorized
+        );
+        ctx.accounts.config.admin = ctx.accounts.config.pending_admin;
+        ctx.accounts.config.pending_admin = Pubkey::default();
         Ok(())
     }
 }
 
-// ----------------------------- Accounts (state) -----------------------------
+// ----------------------------- State -----------------------------
 
 #[account]
 pub struct Config {
     pub admin: Pubkey,
+    pub pending_admin: Pubkey,
+    pub guardian: Pubkey,
     pub collateral_mint: Pubkey,
     pub fee_bps: u16,
+    pub dispute_period: i64,
     pub market_count: u64,
+    pub paused: bool,
     pub bump: u8,
 }
 
 impl Config {
-    pub const SPACE: usize = 8 + 32 + 32 + 2 + 8 + 1;
+    pub const SPACE: usize = 8 + 32 + 32 + 32 + 32 + 2 + 8 + 8 + 1 + 1;
 }
 
 #[account]
@@ -591,6 +851,7 @@ pub struct Market {
     pub market_id: u64,
     pub creator: Pubkey,
     pub resolver: Pubkey,
+    pub resolver_kind: u8,
     pub collateral_mint: Pubkey,
     pub yes_mint: Pubkey,
     pub no_mint: Pubkey,
@@ -601,24 +862,31 @@ pub struct Market {
     pub reserve_no: u64,
     pub lp: Pubkey,
     pub lp_shares: u64,
-    /// Collateral backing outstanding full sets (excludes accrued fees).
+    /// Collateral backing outstanding tokens (excludes accrued fees).
     pub collateral: u64,
     pub fee_accrued: u64,
     pub state: u8,
     pub outcome: u8,
+    pub proposed_outcome: u8,
+    pub close_time: i64,
     pub resolution_time: i64,
+    pub resolved_at: i64,
     pub question: String,
     pub resolution_source: String,
+    /// Forward-compat padding for future oracle resolver configs.
+    pub reserved: [u8; Market::RESERVED],
     pub bump: u8,
 }
 
 impl Market {
     pub const MAX_QUESTION: usize = 200;
     pub const MAX_SOURCE: usize = 80;
+    pub const RESERVED: usize = 64;
     pub const SPACE: usize = 8 // discriminator
         + 8  // market_id
         + 32 // creator
         + 32 // resolver
+        + 1  // resolver_kind
         + 32 // collateral_mint
         + 32 // yes_mint
         + 32 // no_mint
@@ -633,23 +901,51 @@ impl Market {
         + 8  // fee_accrued
         + 1  // state
         + 1  // outcome
+        + 1  // proposed_outcome
+        + 8  // close_time
         + 8  // resolution_time
-        + 4 + Self::MAX_QUESTION   // question
-        + 4 + Self::MAX_SOURCE     // resolution_source
+        + 8  // resolved_at
+        + 4 + Self::MAX_QUESTION
+        + 4 + Self::MAX_SOURCE
+        + Self::RESERVED
         + 1; // bump
+
+    /// Mint for a given side.
+    fn outcome_mint(&self, side: Side) -> Pubkey {
+        match side {
+            Side::Yes => self.yes_mint,
+            Side::No => self.no_mint,
+        }
+    }
+
+    /// `(reserve_of_side, reserve_of_other)`.
+    fn reserves(&self, side: Side) -> (u64, u64) {
+        match side {
+            Side::Yes => (self.reserve_yes, self.reserve_no),
+            Side::No => (self.reserve_no, self.reserve_yes),
+        }
+    }
+
+    /// Write back `(reserve_of_side, reserve_of_other)`.
+    fn set_reserves(&mut self, side: Side, of_side: u64, of_other: u64) {
+        match side {
+            Side::Yes => {
+                self.reserve_yes = of_side;
+                self.reserve_no = of_other;
+            }
+            Side::No => {
+                self.reserve_no = of_side;
+                self.reserve_yes = of_other;
+            }
+        }
+    }
 }
 
 // ----------------------------- Contexts -----------------------------
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(
-        init,
-        payer = admin,
-        space = Config::SPACE,
-        seeds = [CONFIG_SEED],
-        bump
-    )]
+    #[account(init, payer = admin, space = Config::SPACE, seeds = [CONFIG_SEED], bump)]
     pub config: Box<Account<'info, Config>>,
     pub collateral_mint: Box<Account<'info, Mint>>,
     #[account(mut)]
@@ -672,32 +968,20 @@ pub struct CreateMarket<'info> {
     pub market: Box<Account<'info, Market>>,
 
     #[account(
-        init,
-        payer = creator,
-        seeds = [YES_SEED, market.key().as_ref()],
-        bump,
-        mint::decimals = math::DECIMALS,
-        mint::authority = market,
+        init, payer = creator, seeds = [YES_SEED, market.key().as_ref()], bump,
+        mint::decimals = math::DECIMALS, mint::authority = market,
     )]
     pub yes_mint: Box<Account<'info, Mint>>,
 
     #[account(
-        init,
-        payer = creator,
-        seeds = [NO_SEED, market.key().as_ref()],
-        bump,
-        mint::decimals = math::DECIMALS,
-        mint::authority = market,
+        init, payer = creator, seeds = [NO_SEED, market.key().as_ref()], bump,
+        mint::decimals = math::DECIMALS, mint::authority = market,
     )]
     pub no_mint: Box<Account<'info, Mint>>,
 
     #[account(
-        init,
-        payer = creator,
-        seeds = [VAULT_SEED, market.key().as_ref()],
-        bump,
-        token::mint = collateral_mint,
-        token::authority = market,
+        init, payer = creator, seeds = [VAULT_SEED, market.key().as_ref()], bump,
+        token::mint = collateral_mint, token::authority = market,
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
 
@@ -713,11 +997,9 @@ pub struct CreateMarket<'info> {
 
 #[derive(Accounts)]
 pub struct SeedLiquidity<'info> {
-    #[account(
-        mut,
-        seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump,
-    )]
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
 
     #[account(mut, address = market.yes_mint)]
@@ -728,22 +1010,13 @@ pub struct SeedLiquidity<'info> {
     pub vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
-        init,
-        payer = lp,
-        seeds = [POOL_YES_SEED, market.key().as_ref()],
-        bump,
-        token::mint = yes_mint,
-        token::authority = market,
+        init, payer = lp, seeds = [POOL_YES_SEED, market.key().as_ref()], bump,
+        token::mint = yes_mint, token::authority = market,
     )]
     pub pool_yes: Box<Account<'info, TokenAccount>>,
-
     #[account(
-        init,
-        payer = lp,
-        seeds = [POOL_NO_SEED, market.key().as_ref()],
-        bump,
-        token::mint = no_mint,
-        token::authority = market,
+        init, payer = lp, seeds = [POOL_NO_SEED, market.key().as_ref()], bump,
+        token::mint = no_mint, token::authority = market,
     )]
     pub pool_no: Box<Account<'info, TokenAccount>>,
 
@@ -765,12 +1038,7 @@ pub struct SeedLiquidity<'info> {
 pub struct Trade<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
-
-    #[account(
-        mut,
-        seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump,
-    )]
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
 
     #[account(mut, address = market.yes_mint)]
@@ -784,7 +1052,6 @@ pub struct Trade<'info> {
     #[account(mut, address = market.vault)]
     pub vault: Box<Account<'info, TokenAccount>>,
 
-    /// The trader's outcome-token account for the side being traded (validated in handler).
     #[account(mut)]
     pub user_outcome: Box<Account<'info, TokenAccount>>,
     #[account(
@@ -800,23 +1067,40 @@ pub struct Trade<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Resolve<'info> {
-    #[account(
-        mut,
-        seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump,
-    )]
+pub struct ProposeOutcome<'info> {
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
     pub resolver: Signer<'info>,
 }
 
 #[derive(Accounts)]
+pub struct FinalizeOutcome<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    pub cranker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GuardianAction<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    pub guardian: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct VoidStale<'info> {
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    pub cranker: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct Redeem<'info> {
-    #[account(
-        mut,
-        seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump,
-    )]
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
     #[account(mut)]
     pub winning_mint: Box<Account<'info, Mint>>,
@@ -837,14 +1121,12 @@ pub struct Redeem<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimPool<'info> {
-    #[account(
-        mut,
-        seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump,
-    )]
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
-    #[account(mut)]
-    pub winning_mint: Box<Account<'info, Mint>>,
+    #[account(mut, address = market.yes_mint)]
+    pub yes_mint: Box<Account<'info, Mint>>,
+    #[account(mut, address = market.no_mint)]
+    pub no_mint: Box<Account<'info, Mint>>,
     #[account(mut, address = market.pool_yes)]
     pub pool_yes: Box<Account<'info, TokenAccount>>,
     #[account(mut, address = market.pool_no)]
@@ -865,11 +1147,7 @@ pub struct ClaimPool<'info> {
 pub struct CollectFees<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
-    #[account(
-        mut,
-        seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump,
-    )]
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
     #[account(mut, address = market.vault)]
     pub vault: Box<Account<'info, TokenAccount>>,
@@ -883,7 +1161,31 @@ pub struct CollectFees<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct AdminOrGuardian<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminOnly<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    pub pending_admin: Signer<'info>,
+}
+
 // ----------------------------- Events -----------------------------
+
+pub const VOID_REASON_DISPUTE: u8 = 0;
+pub const VOID_REASON_STALE: u8 = 1;
 
 #[event]
 pub struct MarketCreated {
@@ -891,6 +1193,8 @@ pub struct MarketCreated {
     pub market: Pubkey,
     pub creator: Pubkey,
     pub resolver: Pubkey,
+    pub close_time: i64,
+    pub resolution_time: i64,
 }
 
 #[event]
@@ -910,9 +1214,50 @@ pub struct TradeExecuted {
 }
 
 #[event]
+pub struct OutcomeProposed {
+    pub market: Pubkey,
+    pub resolver: Pubkey,
+    pub outcome: u8,
+    pub proposed_at: i64,
+}
+
+#[event]
 pub struct MarketResolved {
     pub market: Pubkey,
     pub outcome: u8,
+    pub resolved_at: i64,
+}
+
+#[event]
+pub struct MarketVoided {
+    pub market: Pubkey,
+    pub reason: u8,
+}
+
+#[event]
+pub struct Redeemed {
+    pub market: Pubkey,
+    pub user: Pubkey,
+    pub amount: u64,
+    pub payout: u64,
+}
+
+#[event]
+pub struct PoolClaimed {
+    pub market: Pubkey,
+    pub lp: Pubkey,
+    pub payout: u64,
+}
+
+#[event]
+pub struct FeesCollected {
+    pub market: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct PausedSet {
+    pub paused: bool,
 }
 
 // ----------------------------- Errors -----------------------------
@@ -921,10 +1266,20 @@ pub struct MarketResolved {
 pub enum ErrorCode {
     #[msg("Fee exceeds the maximum (1000 bps)")]
     FeeTooHigh,
+    #[msg("Invalid parameter")]
+    InvalidParameter,
+    #[msg("Invalid time window (need 0 < now < close_time <= resolution_time <= horizon)")]
+    InvalidTimeWindow,
     #[msg("String exceeds maximum length")]
     StringTooLong,
+    #[msg("Unsupported resolver kind")]
+    UnsupportedResolverKind,
     #[msg("Market is not open for trading")]
     MarketNotOpen,
+    #[msg("Market is closed for trading")]
+    MarketClosed,
+    #[msg("Protocol is paused")]
+    Paused,
     #[msg("Market has already been seeded with liquidity")]
     AlreadySeeded,
     #[msg("Market has no liquidity")]
@@ -945,8 +1300,18 @@ pub enum ErrorCode {
     InsufficientLiquidity,
     #[msg("Market has not been resolved yet")]
     NotResolved,
+    #[msg("No outcome has been proposed")]
+    NotProposed,
+    #[msg("Market is not voided")]
+    NotVoid,
+    #[msg("Dispute window is still open")]
+    DisputeWindowOpen,
+    #[msg("Dispute window has closed")]
+    DisputeWindowClosed,
     #[msg("Too early to resolve this market")]
     TooEarlyToResolve,
+    #[msg("Too early to void this market")]
+    TooEarlyToVoid,
     #[msg("Nothing to claim")]
     NothingToClaim,
     #[msg("Arithmetic overflow")]

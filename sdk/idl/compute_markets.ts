@@ -15,12 +15,52 @@ export type ComputeMarkets = {
   },
   "instructions": [
     {
+      "name": "acceptAdmin",
+      "docs": [
+        "Two-step admin transfer, step 2: the nominee accepts."
+      ],
+      "discriminator": [
+        112,
+        42,
+        45,
+        90,
+        116,
+        181,
+        13,
+        170
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pendingAdmin",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "buy",
       "docs": [
-        "Buy `outcome` (YES=0/NO=1) by investing `collateral_in`. A taker fee is",
-        "deducted, a full set is minted into the pool, and the constant-product",
-        "swap returns outcome tokens to the trader. Reverts if fewer than",
-        "`min_tokens_out` would be received."
+        "Buy `outcome` by investing `collateral_in`. Reverts if fewer than",
+        "`min_tokens_out` would be received, if paused, or after `close_time`."
       ],
       "discriminator": [
         102,
@@ -97,9 +137,6 @@ export type ComputeMarkets = {
         },
         {
           "name": "userOutcome",
-          "docs": [
-            "The trader's outcome-token account for the side being traded (validated in handler)."
-          ],
           "writable": true
         },
         {
@@ -134,7 +171,9 @@ export type ComputeMarkets = {
     {
       "name": "claimPool",
       "docs": [
-        "After resolution, the LP claims the winning-side pool reserve as collateral."
+        "After settlement, the LP reclaims the pool's outcome tokens as collateral:",
+        "the winning-side reserve on a YES/NO resolution, or half of each reserve on",
+        "a void."
       ],
       "discriminator": [
         70,
@@ -172,7 +211,11 @@ export type ComputeMarkets = {
           }
         },
         {
-          "name": "winningMint",
+          "name": "yesMint",
+          "writable": true
+        },
+        {
+          "name": "noMint",
           "writable": true
         },
         {
@@ -283,8 +326,8 @@ export type ComputeMarkets = {
       "name": "createMarket",
       "docs": [
         "Create a new binary market. Permissionless: anyone may create one and",
-        "nominate a `resolver` (the trusted oracle key for this market). The market",
-        "id is the current `config.market_count`, which is then incremented."
+        "nominate a `resolver`. Trading halts at `close_time`; the outcome may be",
+        "proposed at/after `resolution_time` (`close_time <= resolution_time`)."
       ],
       "discriminator": [
         103,
@@ -432,20 +475,163 @@ export type ComputeMarkets = {
           "type": "string"
         },
         {
+          "name": "closeTime",
+          "type": "i64"
+        },
+        {
           "name": "resolutionTime",
           "type": "i64"
         },
         {
           "name": "resolver",
           "type": "pubkey"
+        },
+        {
+          "name": "resolverKind",
+          "type": "u8"
         }
       ]
     },
     {
+      "name": "disputeVoid",
+      "docs": [
+        "Guardian veto: during the dispute window, void a proposed outcome (→ 50/50",
+        "refund). Use when a proposal is wrong or the resolver is compromised."
+      ],
+      "discriminator": [
+        89,
+        108,
+        102,
+        82,
+        100,
+        33,
+        200,
+        14
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "guardian",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "finalizeOutcome",
+      "docs": [
+        "Step 2 of resolution: finalize a proposed outcome once the dispute window",
+        "has elapsed. Permissionless — anyone may crank it."
+      ],
+      "discriminator": [
+        122,
+        242,
+        226,
+        81,
+        187,
+        211,
+        79,
+        179
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cranker",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "initialize",
       "docs": [
-        "Initialize the global config (one per deployment). `fee_bps` is the taker",
-        "fee charged on `buy`/`sell` (e.g. 100 = 1%), capped at 10% (1000 bps)."
+        "Initialize the global config (one per deployment).",
+        "",
+        "* `fee_bps` — taker fee on buy/sell (e.g. 100 = 1%), capped at `MAX_FEE_BPS`.",
+        "* `dispute_period` — seconds between a proposed outcome and payout unlock.",
+        "* `guardian` — key allowed to pause and to veto a proposed outcome."
       ],
       "discriminator": [
         175,
@@ -494,6 +680,67 @@ export type ComputeMarkets = {
         {
           "name": "feeBps",
           "type": "u16"
+        },
+        {
+          "name": "disputePeriod",
+          "type": "i64"
+        },
+        {
+          "name": "guardian",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "proposeOutcome",
+      "docs": [
+        "Step 1 of resolution: the market's `resolver` proposes a winning outcome",
+        "at/after `resolution_time`. Opens the dispute window; payouts stay locked."
+      ],
+      "discriminator": [
+        147,
+        78,
+        55,
+        89,
+        179,
+        236,
+        26,
+        248
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "resolver",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "outcome",
+          "type": "u8"
         }
       ]
     },
@@ -571,20 +818,20 @@ export type ComputeMarkets = {
       ]
     },
     {
-      "name": "resolve",
+      "name": "redeemVoid",
       "docs": [
-        "Resolve the market to a winning `outcome`. Only the market's `resolver`",
-        "may call, and only at/after `resolution_time`."
+        "Redeem `amount` of EITHER outcome token on a voided market for half of",
+        "collateral per token (rounded down). 50/50 refund that conserves the vault."
       ],
       "discriminator": [
-        246,
-        150,
-        236,
-        206,
-        108,
-        63,
-        58,
-        10
+        43,
+        230,
+        73,
+        156,
+        254,
+        174,
+        252,
+        196
       ],
       "accounts": [
         {
@@ -612,14 +859,35 @@ export type ComputeMarkets = {
           }
         },
         {
-          "name": "resolver",
+          "name": "winningMint",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "userOutcome",
+          "writable": true
+        },
+        {
+          "name": "userCollateral",
+          "writable": true
+        },
+        {
+          "name": "user",
+          "writable": true,
           "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
         {
-          "name": "outcome",
-          "type": "u8"
+          "name": "amount",
+          "type": "u64"
         }
       ]
     },
@@ -627,8 +895,7 @@ export type ComputeMarkets = {
       "name": "seedLiquidity",
       "docs": [
         "Seed the AMM with initial liquidity at 50/50 odds. Callable once, by the",
-        "market creator, before any trading. Mints `amount` of each outcome into",
-        "the pool and deposits `amount` collateral."
+        "market creator, before any trading."
       ],
       "discriminator": [
         180,
@@ -641,6 +908,24 @@ export type ComputeMarkets = {
         11
       ],
       "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
         {
           "name": "market",
           "writable": true,
@@ -758,10 +1043,8 @@ export type ComputeMarkets = {
     {
       "name": "sell",
       "docs": [
-        "Sell `outcome` to withdraw `collateral_out` of collateral (gross). The",
-        "trader returns outcome tokens to the pool, a full set is merged out, the",
-        "taker fee is deducted, and the remainder is paid to the trader. Reverts if",
-        "more than `max_tokens_in` outcome tokens would be required."
+        "Sell `outcome` to withdraw `collateral_out` (gross). Reverts if more than",
+        "`max_tokens_in` would be required, if paused, or after `close_time`."
       ],
       "discriminator": [
         51,
@@ -838,9 +1121,6 @@ export type ComputeMarkets = {
         },
         {
           "name": "userOutcome",
-          "docs": [
-            "The trader's outcome-token account for the side being traded (validated in handler)."
-          ],
           "writable": true
         },
         {
@@ -871,6 +1151,242 @@ export type ComputeMarkets = {
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "setAdmin",
+      "docs": [
+        "Two-step admin transfer, step 1: nominate a new admin."
+      ],
+      "discriminator": [
+        251,
+        163,
+        0,
+        52,
+        91,
+        194,
+        187,
+        92
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "newAdmin",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "setFeeBps",
+      "docs": [
+        "Update the taker fee (admin only), re-checked against `MAX_FEE_BPS`."
+      ],
+      "discriminator": [
+        2,
+        161,
+        245,
+        141,
+        111,
+        32,
+        39,
+        198
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "feeBps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "setGuardian",
+      "docs": [
+        "Update the guardian (admin only)."
+      ],
+      "discriminator": [
+        147,
+        243,
+        50,
+        121,
+        154,
+        164,
+        50,
+        30
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "guardian",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "setPaused",
+      "docs": [
+        "Pause or unpause all trading. Callable by the admin or the guardian."
+      ],
+      "discriminator": [
+        91,
+        60,
+        125,
+        192,
+        176,
+        225,
+        166,
+        218
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "paused",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "voidStale",
+      "docs": [
+        "Liveness escape hatch: if the resolver never proposes, anyone may void a",
+        "stale market `VOID_GRACE_PERIOD` after `resolution_time`, freeing collateral."
+      ],
+      "discriminator": [
+        203,
+        244,
+        15,
+        146,
+        222,
+        43,
+        30,
+        226
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cranker",
+          "signer": true
+        }
+      ],
+      "args": []
     }
   ],
   "accounts": [
@@ -902,6 +1418,19 @@ export type ComputeMarkets = {
     }
   ],
   "events": [
+    {
+      "name": "feesCollected",
+      "discriminator": [
+        233,
+        23,
+        117,
+        225,
+        107,
+        178,
+        254,
+        8
+      ]
+    },
     {
       "name": "liquiditySeeded",
       "discriminator": [
@@ -942,6 +1471,71 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "marketVoided",
+      "discriminator": [
+        217,
+        12,
+        138,
+        39,
+        108,
+        75,
+        89,
+        26
+      ]
+    },
+    {
+      "name": "outcomeProposed",
+      "discriminator": [
+        100,
+        79,
+        89,
+        60,
+        234,
+        81,
+        68,
+        43
+      ]
+    },
+    {
+      "name": "pausedSet",
+      "discriminator": [
+        171,
+        125,
+        127,
+        156,
+        233,
+        81,
+        68,
+        66
+      ]
+    },
+    {
+      "name": "poolClaimed",
+      "discriminator": [
+        36,
+        11,
+        190,
+        83,
+        128,
+        77,
+        196,
+        150
+      ]
+    },
+    {
+      "name": "redeemed",
+      "discriminator": [
+        14,
+        29,
+        183,
+        71,
+        31,
+        165,
+        107,
+        38
+      ]
+    },
+    {
       "name": "tradeExecuted",
       "discriminator": [
         41,
@@ -963,76 +1557,126 @@ export type ComputeMarkets = {
     },
     {
       "code": 6001,
+      "name": "invalidParameter",
+      "msg": "Invalid parameter"
+    },
+    {
+      "code": 6002,
+      "name": "invalidTimeWindow",
+      "msg": "Invalid time window (need 0 < now < close_time <= resolution_time <= horizon)"
+    },
+    {
+      "code": 6003,
       "name": "stringTooLong",
       "msg": "String exceeds maximum length"
     },
     {
-      "code": 6002,
+      "code": 6004,
+      "name": "unsupportedResolverKind",
+      "msg": "Unsupported resolver kind"
+    },
+    {
+      "code": 6005,
       "name": "marketNotOpen",
       "msg": "Market is not open for trading"
     },
     {
-      "code": 6003,
+      "code": 6006,
+      "name": "marketClosed",
+      "msg": "Market is closed for trading"
+    },
+    {
+      "code": 6007,
+      "name": "paused",
+      "msg": "Protocol is paused"
+    },
+    {
+      "code": 6008,
       "name": "alreadySeeded",
       "msg": "Market has already been seeded with liquidity"
     },
     {
-      "code": 6004,
+      "code": 6009,
       "name": "noLiquidity",
       "msg": "Market has no liquidity"
     },
     {
-      "code": 6005,
+      "code": 6010,
       "name": "zeroAmount",
       "msg": "Amount must be greater than zero"
     },
     {
-      "code": 6006,
+      "code": 6011,
       "name": "invalidOutcome",
       "msg": "Invalid outcome (must be 0=YES or 1=NO)"
     },
     {
-      "code": 6007,
+      "code": 6012,
       "name": "unauthorized",
       "msg": "unauthorized"
     },
     {
-      "code": 6008,
+      "code": 6013,
       "name": "wrongMint",
       "msg": "Wrong token mint for this account"
     },
     {
-      "code": 6009,
+      "code": 6014,
       "name": "wrongOwner",
       "msg": "Wrong owner for this token account"
     },
     {
-      "code": 6010,
+      "code": 6015,
       "name": "slippageExceeded",
       "msg": "Slippage tolerance exceeded"
     },
     {
-      "code": 6011,
+      "code": 6016,
       "name": "insufficientLiquidity",
       "msg": "Insufficient liquidity for this trade"
     },
     {
-      "code": 6012,
+      "code": 6017,
       "name": "notResolved",
       "msg": "Market has not been resolved yet"
     },
     {
-      "code": 6013,
+      "code": 6018,
+      "name": "notProposed",
+      "msg": "No outcome has been proposed"
+    },
+    {
+      "code": 6019,
+      "name": "notVoid",
+      "msg": "Market is not voided"
+    },
+    {
+      "code": 6020,
+      "name": "disputeWindowOpen",
+      "msg": "Dispute window is still open"
+    },
+    {
+      "code": 6021,
+      "name": "disputeWindowClosed",
+      "msg": "Dispute window has closed"
+    },
+    {
+      "code": 6022,
       "name": "tooEarlyToResolve",
       "msg": "Too early to resolve this market"
     },
     {
-      "code": 6014,
+      "code": 6023,
+      "name": "tooEarlyToVoid",
+      "msg": "Too early to void this market"
+    },
+    {
+      "code": 6024,
       "name": "nothingToClaim",
       "msg": "Nothing to claim"
     },
     {
-      "code": 6015,
+      "code": 6025,
       "name": "mathOverflow",
       "msg": "Arithmetic overflow"
     }
@@ -1048,6 +1692,14 @@ export type ComputeMarkets = {
             "type": "pubkey"
           },
           {
+            "name": "pendingAdmin",
+            "type": "pubkey"
+          },
+          {
+            "name": "guardian",
+            "type": "pubkey"
+          },
+          {
             "name": "collateralMint",
             "type": "pubkey"
           },
@@ -1056,12 +1708,36 @@ export type ComputeMarkets = {
             "type": "u16"
           },
           {
+            "name": "disputePeriod",
+            "type": "i64"
+          },
+          {
             "name": "marketCount",
             "type": "u64"
           },
           {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
             "name": "bump",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "feesCollected",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
           }
         ]
       }
@@ -1098,6 +1774,10 @@ export type ComputeMarkets = {
           {
             "name": "resolver",
             "type": "pubkey"
+          },
+          {
+            "name": "resolverKind",
+            "type": "u8"
           },
           {
             "name": "collateralMint",
@@ -1142,7 +1822,7 @@ export type ComputeMarkets = {
           {
             "name": "collateral",
             "docs": [
-              "Collateral backing outstanding full sets (excludes accrued fees)."
+              "Collateral backing outstanding tokens (excludes accrued fees)."
             ],
             "type": "u64"
           },
@@ -1159,7 +1839,19 @@ export type ComputeMarkets = {
             "type": "u8"
           },
           {
+            "name": "proposedOutcome",
+            "type": "u8"
+          },
+          {
+            "name": "closeTime",
+            "type": "i64"
+          },
+          {
             "name": "resolutionTime",
+            "type": "i64"
+          },
+          {
+            "name": "resolvedAt",
             "type": "i64"
           },
           {
@@ -1169,6 +1861,18 @@ export type ComputeMarkets = {
           {
             "name": "resolutionSource",
             "type": "string"
+          },
+          {
+            "name": "reserved",
+            "docs": [
+              "Forward-compat padding for future oracle resolver configs."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
           },
           {
             "name": "bump",
@@ -1197,6 +1901,14 @@ export type ComputeMarkets = {
           {
             "name": "resolver",
             "type": "pubkey"
+          },
+          {
+            "name": "closeTime",
+            "type": "i64"
+          },
+          {
+            "name": "resolutionTime",
+            "type": "i64"
           }
         ]
       }
@@ -1213,6 +1925,106 @@ export type ComputeMarkets = {
           {
             "name": "outcome",
             "type": "u8"
+          },
+          {
+            "name": "resolvedAt",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "marketVoided",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "reason",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "outcomeProposed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "resolver",
+            "type": "pubkey"
+          },
+          {
+            "name": "outcome",
+            "type": "u8"
+          },
+          {
+            "name": "proposedAt",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pausedSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "paused",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolClaimed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "lp",
+            "type": "pubkey"
+          },
+          {
+            "name": "payout",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "redeemed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "user",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "payout",
+            "type": "u64"
           }
         ]
       }
