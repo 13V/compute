@@ -1,9 +1,12 @@
 # Compute — Frontend
 
-A Next.js (pages router) app for trading YES/NO on **Compute** prediction markets,
-an on-chain FPMM prediction market on Solana. Connect a Solana wallet, browse
-markets, buy/sell outcome tokens, redeem winnings, and drive the multi-step
-settlement flow (propose → dispute window → finalize, or guardian veto → void).
+A Next.js (pages router) app for **Compute**, an on-chain FPMM prediction market
+on Solana. Connect a Solana wallet, browse every market kind, buy/sell outcome
+tokens, provide/withdraw liquidity, drive all four resolver paths, and redeem.
+
+It surfaces **both market kinds** (Binary YES/NO and Scalar LONG/SHORT over a
+`[lower, upper]` range) and **all three resolver kinds** (Trusted key, Oracle
+feed, Optimistic bonded assert/dispute), plus voids and multi-LP liquidity.
 
 Program id: `8xv1L7757szxo2XPrQL5AERPGZrJaYRKgqB9RgFkQCU2`
 
@@ -44,38 +47,64 @@ npm run build
 npm run start
 ```
 
-## What's here
+## Flows surfaced
 
-- **`pages/index.tsx`** — market list. Fetches `listMarkets()`, shows each
-  market's question, resolution source, Open/Resolved state, current YES/NO
-  marginal prices, reserves, and collateral (TVL). Links to detail.
-- **`pages/market/[id].tsx`** — market detail + state-driven panels. Controls are
-  driven off `market.state` (Open/Resolving/Resolved/Void) and the clock
-  (`closeTime`, `resolutionTime`, dispute window):
-  - **Buy / Sell** (only while OPEN and `now < closeTime`): pick YES/NO via an
-    accessible radiogroup, preview tokens via `quoteBuy`/`quoteSell` (fee-aware),
-    see price impact, set slippage (clamped 0–50%, warns above ~5%), and a **Max**
-    button. Buy is disabled on insufficient USDC; Sell respects both held balance
-    and `market.collateral` (the chain rejects `collateral_out > collateral`).
-    Past `closeTime`, trading is disabled with a "closed" notice.
-  - **Resolver** (wallet == `market.resolver`, OPEN & `now >= resolutionTime`):
-    **Propose YES / Propose NO** via `proposeOutcomeIx()`.
-  - **Resolving**: shows the proposed outcome + a dispute-window countdown
-    (`resolvedAt + config.disputePeriod`). After it elapses, anyone can
-    **Finalize** (`finalizeOutcomeIx()`). While open, the **guardian**
-    (wallet == `config.guardian`) sees **Dispute / Void** (`disputeVoidIx()`).
-  - **Resolved**: winners **Redeem** the winning side 1:1 (`redeemIx()`); the LP
-    (wallet == `market.lp`) can **Claim pool** (`claimPoolIx()`).
-  - **Void**: 50/50 refund — holders **Redeem (refund)** for whichever side they
-    hold (`redeemVoidIx()`); LP can **Claim pool**.
-  - A **trust/risk panel** explains settlement (single trusted resolver, no
-    external oracle), the dispute window, guardian veto, and 50/50 voids, and
-    shows the (copyable) resolver + guardian pubkeys and a cluster badge.
-  - Shows your USDC / YES / NO balances. State badge + absolute/relative
-    close/resolution times appear on both the list and detail header.
+- **`pages/index.tsx`** — market list. For each market it shows the **kind**
+  badge (Binary, or Scalar with its `[lower, upper]` range), the **resolver-kind**
+  badge (Trusted / Oracle feed / Optimistic), the state badge, prices
+  (binary: YES/NO marginal price; scalar: LONG/SHORT price + the implied/settled
+  value `lower + price·(upper−lower)`), reserves, collateral (TVL), and
+  close/resolve times. Links to detail.
+- **`pages/market/[id].tsx`** — market detail + state-driven panels, driven off
+  `market.state` (Open/Resolving/Resolved/Void), `market.kind`,
+  `market.resolverKind`, and the clock (`closeTime`, `resolutionTime`, dispute
+  window):
+  - **Header** shows kind/resolver/state badges and, for scalar markets, the
+    `[lower, upper]` range and implied/settled value.
+  - **Config panel** — `feeBps`, `lpFeeBps`, `bondAmount`, `disputePeriod`,
+    `paused`, guardian, plus a cluster badge.
+  - **Buy / Sell** (OPEN & `now < closeTime`): same `buyIxs`/`sellIx` for both
+    kinds; for scalar the sides are relabeled **LONG/SHORT** and a note explains
+    LONG pays `fraction·1`, SHORT pays `(1−fraction)·1` at settlement. Fee-aware
+    `quoteBuy`/`quoteSell` previews, price impact, slippage (0–50%, warns >5%),
+    **Max** buttons, insufficient-balance and `collateral`-cap guards.
+  - **Liquidity** (multi-LP): **Add liquidity** (USDC → `addLiquidityIxs`,
+    returns price-preserving outcome tokens) and **Remove liquidity** (shares →
+    `removeLiquidityIxs`). Shows your `LiquidityPosition` shares
+    (`fetchLiquidityPosition`, treated as 0 if absent) and the pool's
+    `totalShares`.
+  - **Resolution controls** branch on `resolverKind`:
+    - **Trusted** — resolver proposes (binary: **Propose YES/NO** via
+      `proposeOutcomeIx`; scalar: settlement-value input → `proposeScalarIx`).
+      Then a dispute-window countdown (`resolvedAt + disputePeriod`), anyone
+      **Finalize** (`finalizeOutcomeIx`), guardian **Dispute → Void**
+      (`disputeVoidIx`).
+    - **Oracle feed** — shows the `oracleFeed`, its current value
+      (`fetchPriceFeed`), strike/comparison, and max staleness; anyone
+      **Resolve from oracle** (`proposeFromOracleIx`) past resolution time, then
+      the same finalize/dispute window.
+    - **Optimistic** — anyone **Assert YES/NO** (`assertOutcomeIxs`, posts the
+      `bondAmount` bond); in RESOLVING shows asserter / proposed outcome / bond /
+      disputed, anyone (≠ asserter) **Dispute** (`disputeAssertionIx`),
+      **Finalize assertion** (`finalizeAssertionIx`) if undisputed after the
+      window, and the **guardian** **Resolve YES/NO** (`resolveDisputeIx`) if
+      disputed — bonds route to the correct asserter.
+  - **Redeem** (RESOLVED): binary → `redeemIx` (winning side 1:1); scalar →
+    `redeemScalarIx` for LONG and/or SHORT (each pays at the settled fraction,
+    with a payout preview); LP → `claimPoolIx`.
+  - **Void**: 50/50 refund — holders **Redeem (refund)** for either held side
+    (`redeemVoidIx`); LP can **Claim pool**.
+  - A **trust/risk panel** explains the active resolver's settlement model, the
+    dispute window, guardian veto, and 50/50 voids, with copyable resolver +
+    guardian pubkeys and a cluster badge.
+  - Shows your USDC, outcome-token, and LP-share balances.
 - Tx failures are decoded via `client.parseError()`. On success, the signature is
-  shown with a copy button and a cluster-aware explorer link; market data +
-  balances refresh automatically.
+  shown with a copy button and a cluster-aware explorer link; market data,
+  balances, and LP position refresh automatically after every tx.
+
+> Market **creation** and oracle-feed publishing are handled by an off-app seed
+> script; this app drives the trader / LP / resolver experience for existing
+> markets of every kind.
 
 ## `app/lib` is copied from `/sdk`
 

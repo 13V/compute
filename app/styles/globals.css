@@ -135,6 +135,32 @@ a:hover {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+/* Market-kind + resolver-kind badges. */
+.kindrow {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.badge.kind.binary {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.badge.kind.scalar {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.badge.resolver.trusted {
+  color: var(--muted);
+  border-color: var(--muted);
+}
+.badge.resolver.oracle {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.badge.resolver.optimistic {
+  color: var(--yes);
+  border-color: var(--yes);
+}
 .badge.cluster.mainnet {
   color: var(--yes);
   border-color: var(--yes);

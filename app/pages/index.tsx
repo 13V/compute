@@ -5,13 +5,29 @@ import { useReadClient } from "../components/useComputeClient";
 import { useNow, marketStateLabel, StateBadge } from "../components/ui";
 import type { MarketEntry } from "../components/types";
 import {
+  isScalar,
+  marketKindLabel,
+  resolverKindLabel,
+  resolverKindClass,
+  impliedScalarValue,
+} from "../components/market";
+import {
   formatUnits,
   formatPct,
   formatAbsTime,
   formatRelTime,
 } from "../lib/format";
-import { STATE_RESOLVED, STATE_VOID } from "../lib/pdas";
+import { STATE_RESOLVED, STATE_VOID, OUTCOME_YES } from "../lib/pdas";
 import { marginalPrice as marginal } from "../lib/amm";
+import {
+  settledScalarValue,
+  settledLongFraction,
+} from "../components/market";
+
+function fmtNum(n: number): string {
+  // Trim to at most 2 decimals, drop trailing zeros.
+  return Number.isFinite(n) ? parseFloat(n.toFixed(2)).toString() : "—";
+}
 
 export default function Home() {
   const client = useReadClient();
@@ -70,9 +86,16 @@ export default function Home() {
       {markets &&
         markets.map((m) => {
           const a = m.account;
-          const yesPrice = marginal(a.reserveYes, a.reserveNo);
-          const noPrice = marginal(a.reserveNo, a.reserveYes);
+          const scalar = isScalar(a);
+          // For scalar markets YES=LONG, NO=SHORT.
+          const longPrice = marginal(a.reserveYes, a.reserveNo);
+          const shortPrice = marginal(a.reserveNo, a.reserveYes);
           const label = marketStateLabel(a.state, a.closeTime.toNumber(), now);
+          const impliedVal = scalar
+            ? impliedScalarValue(longPrice, a.lowerBound, a.upperBound)
+            : 0;
+          const settledVal = a.state === STATE_RESOLVED ? settledScalarValue(a) : null;
+          const settledFrac = settledLongFraction(a);
           return (
             <Link
               key={m.publicKey.toBase58()}
@@ -83,25 +106,69 @@ export default function Home() {
                 <strong style={{ fontSize: 16 }}>{a.question}</strong>
                 <StateBadge label={label} />
               </div>
-              <div className="small muted" style={{ marginTop: 4 }}>
+              <div className="kindrow" style={{ marginTop: 6 }}>
+                <span className={`badge kind ${scalar ? "scalar" : "binary"}`}>
+                  {marketKindLabel(a.marketKind)}
+                  {scalar && (
+                    <>
+                      {" "}
+                      [{fmtNum(a.lowerBound.toNumber())},{" "}
+                      {fmtNum(a.upperBound.toNumber())}]
+                    </>
+                  )}
+                </span>
+                <span className={`badge resolver ${resolverKindClass(a.resolverKind)}`}>
+                  {resolverKindLabel(a.resolverKind)}
+                </span>
+              </div>
+              <div className="small muted" style={{ marginTop: 6 }}>
                 Source: {a.resolutionSource || "—"}
               </div>
-              <div className="prices">
-                <div className="price-pill yes">
-                  <div className="lab">YES</div>
-                  <div className="val">{formatPct(yesPrice)}</div>
+
+              {scalar ? (
+                <>
+                  <div className="prices">
+                    <div className="price-pill yes">
+                      <div className="lab">LONG</div>
+                      <div className="val">{formatPct(longPrice)}</div>
+                    </div>
+                    <div className="price-pill no">
+                      <div className="lab">SHORT</div>
+                      <div className="val">{formatPct(shortPrice)}</div>
+                    </div>
+                  </div>
+                  <div className="kv">
+                    <span className="k">
+                      {settledVal != null ? "Settled value" : "Implied value"}
+                    </span>
+                    <span>
+                      {settledVal != null
+                        ? fmtNum(settledVal)
+                        : fmtNum(impliedVal)}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div className="prices">
+                  <div className="price-pill yes">
+                    <div className="lab">YES</div>
+                    <div className="val">{formatPct(longPrice)}</div>
+                  </div>
+                  <div className="price-pill no">
+                    <div className="lab">NO</div>
+                    <div className="val">{formatPct(shortPrice)}</div>
+                  </div>
                 </div>
-                <div className="price-pill no">
-                  <div className="lab">NO</div>
-                  <div className="val">{formatPct(noPrice)}</div>
-                </div>
-              </div>
+              )}
+
               <div className="kv">
                 <span className="k">Collateral (TVL)</span>
                 <span>{formatUnits(a.collateral)} USDC</span>
               </div>
               <div className="kv">
-                <span className="k">Reserves (YES / NO)</span>
+                <span className="k">
+                  Reserves ({scalar ? "LONG / SHORT" : "YES / NO"})
+                </span>
                 <span>
                   {formatUnits(a.reserveYes)} / {formatUnits(a.reserveNo)}
                 </span>
@@ -122,7 +189,15 @@ export default function Home() {
               {a.state === STATE_RESOLVED && (
                 <div className="kv">
                   <span className="k">Outcome</span>
-                  <span>{a.outcome === 0 ? "YES" : "NO"}</span>
+                  <span>
+                    {scalar
+                      ? `Settled fraction ${
+                          settledFrac != null ? formatPct(settledFrac) : "—"
+                        }`
+                      : a.outcome === OUTCOME_YES
+                      ? "YES"
+                      : "NO"}
+                  </span>
                 </div>
               )}
               {a.state === STATE_VOID && (
