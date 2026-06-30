@@ -696,4 +696,240 @@ describe("compute-markets", () => {
       await assertConservation(marketId, "scalar-oracle-redeem");
     });
   });
+
+  describe("multi-LP liquidity", () => {
+    async function fetchShares(marketId: number, owner: PublicKey): Promise<BN> {
+      const m = deriveMarketAccounts(marketId).market;
+      const pos = await client.fetchLiquidityPosition(m, owner);
+      return pos ? pos.shares : new BN(0);
+    }
+
+    it("creator seed sets total_shares == amount and a 100% position", async () => {
+      const seed = USDC(1000);
+      const marketId = await createSeededMarket({ seed, resolutionOffset: 60, closeOffset: 60 });
+      const m = await client.fetchMarketById(marketId);
+      assert.strictEqual(m.totalShares.toString(), seed.toString(), "total_shares == seed");
+      assert.strictEqual((await fetchShares(marketId, admin.publicKey)).toString(), seed.toString());
+      await assertConservation(marketId, "seed");
+    });
+
+    it("second provider add_liquidity: ratio preserved, shares grow, sendback paid, conserves", async () => {
+      // Seed 1000, then skew the pool with a YES buy so reserves are uneven.
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      await buy(user1, marketId, OUTCOME_YES, USDC(400));
+
+      const before = await client.fetchMarketById(marketId);
+      const priceBefore = marginalPrice(before.reserveYes, before.reserveNo);
+      const totalBefore = before.totalShares;
+
+      // user2 adds liquidity.
+      const addAmount = USDC(500);
+      const a2 = deriveMarketAccounts(marketId);
+      const u2Yes = getAssociatedTokenAddressSync(a2.yesMint, user2.publicKey);
+      const u2No = getAssociatedTokenAddressSync(a2.noMint, user2.publicKey);
+      const u2YesBefore = await tokenBalance(u2Yes);
+      const u2NoBefore = await tokenBalance(u2No);
+
+      await send(await client.addLiquidityIxs(user2.publicKey, marketId, addAmount, usdcMint), user2);
+      await assertConservation(marketId, "add-liquidity");
+
+      const after = await client.fetchMarketById(marketId);
+      const priceAfter = marginalPrice(after.reserveYes, after.reserveNo);
+      // Price ratio preserved within a tiny rounding tolerance.
+      assert.isBelow(Math.abs(priceAfter - priceBefore), 1e-4, `price drift ${priceBefore}->${priceAfter}`);
+      // total_shares grew.
+      assert.isTrue(after.totalShares.gt(totalBefore), "total_shares grew");
+      // user2 has a non-zero position.
+      const u2Shares = await fetchShares(marketId, user2.publicKey);
+      assert.isTrue(u2Shares.gtn(0), "user2 got shares");
+      // user2 received sendback outcome tokens on the cheaper side(s) (at least one
+      // side > 0 for a skewed pool).
+      const u2YesGot = (await tokenBalance(u2Yes)).sub(u2YesBefore);
+      const u2NoGot = (await tokenBalance(u2No)).sub(u2NoBefore);
+      assert.isTrue(u2YesGot.add(u2NoGot).gtn(0), "user2 got sendback tokens");
+      // Collateral grew by exactly the deposit.
+      assert.strictEqual(after.collateral.sub(before.collateral).toString(), addAmount.toString());
+    });
+
+    it("two LPs claim pro-rata after resolution; pool drains; vault ends at fees", async () => {
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 8, closeOffset: 8 });
+      // user2 adds, then trades happen.
+      await send(await client.addLiquidityIxs(user2.publicKey, marketId, USDC(1000), usdcMint), user2);
+      await buy(user1, marketId, OUTCOME_YES, USDC(300));
+      await buy(user1, marketId, OUTCOME_NO, USDC(150));
+
+      const before = await client.fetchMarketById(marketId);
+      const adminShares = await fetchShares(marketId, admin.publicKey);
+      const u2Shares = await fetchShares(marketId, user2.publicKey);
+      assert.strictEqual(
+        adminShares.add(u2Shares).toString(),
+        before.totalShares.toString(),
+        "all shares accounted for"
+      );
+
+      // Resolve YES.
+      await waitChainTime(before.resolutionTime.toNumber() + 1);
+      await send([await client.proposeOutcomeIx(admin.publicKey, marketId, OUTCOME_YES)], admin);
+      const proposed = await client.fetchMarketById(marketId);
+      await waitChainTime(proposed.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeOutcomeIx(user1.publicKey, marketId)], user1);
+
+      // Both providers claim. Each LP's slice is computed by the program against
+      // the LIVE reserve/total at claim time, so the first claimer shrinks both
+      // for the second. Capture the winning reserve before any claim for the
+      // aggregate-conservation check.
+      const adminUsdc = getAssociatedTokenAddressSync(usdcMint, admin.publicKey);
+      const u2Usdc = getAssociatedTokenAddressSync(usdcMint, user2.publicKey);
+      const adminUsdcBefore = await tokenBalance(adminUsdc);
+      const u2UsdcBefore = await tokenBalance(u2Usdc);
+      const resolved = await client.fetchMarketById(marketId);
+      const winReserveBefore = resolved.reserveYes; // YES won
+
+      // Admin claims first against the full pool.
+      const mAdmin = await client.fetchMarketById(marketId);
+      const adminExpected = mAdmin.reserveYes.mul(adminShares).div(mAdmin.totalShares);
+      await send([await client.claimPoolIx(admin.publicKey, marketId, usdcMint)], admin);
+      await assertConservation(marketId, "claim-admin");
+
+      // user2 claims against the reduced pool (admin's slice already removed).
+      const mU2 = await client.fetchMarketById(marketId);
+      const u2Expected = mU2.reserveYes.mul(u2Shares).div(mU2.totalShares);
+      await send([await client.claimPoolIx(user2.publicKey, marketId, usdcMint)], user2);
+      await assertConservation(marketId, "claim-user2");
+
+      const adminGot = (await tokenBalance(adminUsdc)).sub(adminUsdcBefore);
+      const u2Got = (await tokenBalance(u2Usdc)).sub(u2UsdcBefore);
+      assert.strictEqual(adminGot.toString(), adminExpected.toString(), "admin pro-rata claim");
+      assert.strictEqual(u2Got.toString(), u2Expected.toString(), "user2 pro-rata claim");
+      // Sum of claims never exceeds the original winning reserve (floor dust may remain).
+      assert.isTrue(adminGot.add(u2Got).lte(winReserveBefore), "claims <= backed collateral");
+
+      // Positions zeroed, total_shares drained.
+      assert.strictEqual((await fetchShares(marketId, admin.publicKey)).toString(), "0");
+      assert.strictEqual((await fetchShares(marketId, user2.publicKey)).toString(), "0");
+      const drained = await client.fetchMarketById(marketId);
+      assert.strictEqual(drained.totalShares.toString(), "0", "all shares burned");
+
+      // Let any remaining winning-token holder redeem, collect fees, vault -> 0..fee.
+      await send([await client.collectFeesIx(admin.publicKey, marketId, usdcMint)], admin);
+      const end = await client.fetchMarketById(marketId);
+      assert.strictEqual(end.feeAccrued.toString(), "0", "fees collected");
+    });
+
+    it("remove_liquidity returns proportional YES+NO and decrements shares", async () => {
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      await send(await client.addLiquidityIxs(user2.publicKey, marketId, USDC(1000), usdcMint), user2);
+      await buy(user1, marketId, OUTCOME_YES, USDC(200)); // skew it
+
+      const m = await client.fetchMarketById(marketId);
+      const u2Shares = await fetchShares(marketId, user2.publicKey);
+      const half = u2Shares.divn(2);
+      const expYes = m.reserveYes.mul(half).div(m.totalShares);
+      const expNo = m.reserveNo.mul(half).div(m.totalShares);
+
+      const a2 = deriveMarketAccounts(marketId);
+      const u2Yes = getAssociatedTokenAddressSync(a2.yesMint, user2.publicKey);
+      const u2No = getAssociatedTokenAddressSync(a2.noMint, user2.publicKey);
+      const u2YesBefore = await tokenBalance(u2Yes);
+      const u2NoBefore = await tokenBalance(u2No);
+
+      await send(await client.removeLiquidityIxs(user2.publicKey, marketId, half), user2);
+      await assertConservation(marketId, "remove-liquidity"); // collateral unchanged
+
+      assert.strictEqual((await tokenBalance(u2Yes)).sub(u2YesBefore).toString(), expYes.toString(), "YES out");
+      assert.strictEqual((await tokenBalance(u2No)).sub(u2NoBefore).toString(), expNo.toString(), "NO out");
+      assert.strictEqual(
+        (await fetchShares(marketId, user2.publicKey)).toString(),
+        u2Shares.sub(half).toString(),
+        "shares decremented"
+      );
+    });
+
+    it("no value extraction: add then immediately remove returns <= deposited value", async () => {
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      await buy(user1, marketId, OUTCOME_YES, USDC(350)); // skew before user2 enters
+
+      const a2 = deriveMarketAccounts(marketId);
+      const u2Yes = getAssociatedTokenAddressSync(a2.yesMint, user2.publicKey);
+      const u2No = getAssociatedTokenAddressSync(a2.noMint, user2.publicKey);
+      const yes0 = await tokenBalance(u2Yes);
+      const no0 = await tokenBalance(u2No);
+
+      const addAmount = USDC(500);
+      await send(await client.addLiquidityIxs(user2.publicKey, marketId, addAmount, usdcMint), user2);
+      const minted = await fetchShares(marketId, user2.publicKey);
+      // Immediately remove ALL minted shares.
+      await send(await client.removeLiquidityIxs(user2.publicKey, marketId, minted), user2);
+      await assertConservation(marketId, "extract-roundtrip");
+
+      // user2 now holds (sendback + slice) of each side. The collateral they can
+      // reconstruct by merging full YES+NO sets is min(totalYes,totalNo); it must
+      // not exceed the addAmount they deposited.
+      const yesHeld = (await tokenBalance(u2Yes)).sub(yes0);
+      const noHeld = (await tokenBalance(u2No)).sub(no0);
+      const mergeable = BN.min(yesHeld, noHeld);
+      assert.isTrue(
+        mergeable.lte(addAmount),
+        `extracted value ${mergeable} > deposited ${addAmount}`
+      );
+      // Position fully drained.
+      assert.strictEqual((await fetchShares(marketId, user2.publicKey)).toString(), "0");
+    });
+
+    it("rejects add to an unseeded market (NoLiquidity)", async () => {
+      const now = nowSec();
+      const { ix, marketId } = await client.createMarketIx(
+        admin.publicKey,
+        {
+          question: `Unseeded #${Math.random()}`,
+          resolutionSource: "Silicon Data SDH100RT",
+          closeTime: new BN(now + 60),
+          resolutionTime: new BN(now + 60),
+          resolver: admin.publicKey,
+        },
+        usdcMint
+      );
+      await send([ix], admin);
+      // No seed -> pools don't exist; the address constraint on pool_yes fails
+      // (market.pool_yes is default) OR NoLiquidity. Either way it must revert.
+      const msg = await sendExpectFail(
+        await client.addLiquidityIxs(user2.publicKey, marketId, USDC(100), usdcMint),
+        user2
+      );
+      assert.match(msg, /NoLiquidity|AccountNotInitialized|ConstraintAddress|Error/);
+    });
+
+    it("rejects remove of more shares than owned (InsufficientShares)", async () => {
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      await send(await client.addLiquidityIxs(user2.publicKey, marketId, USDC(500), usdcMint), user2);
+      const u2Shares = await fetchShares(marketId, user2.publicKey);
+      const tooMany = u2Shares.addn(1);
+      const msg = await sendExpectFail(
+        await client.removeLiquidityIxs(user2.publicKey, marketId, tooMany),
+        user2
+      );
+      assert.match(msg, /InsufficientShares/);
+    });
+
+    it("rejects a dust add that would mint 0 shares (ZeroAmount)", async () => {
+      // Inflate the pool weight so a 1-unit add floors to 0 shares minted.
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      // weight ~1e9; adding 1 base unit => shares = floor(1 * 1e9 / 1e9) = 1, not 0.
+      // To force 0, grow the weight above total_shares via a large add then a tiny add.
+      // Simpler: a 1-unit add when weight > total_shares yields 0. Skew so reserve max
+      // exceeds total_shares: buy pushes one reserve far up.
+      await buy(user1, marketId, OUTCOME_NO, USDC(800));
+      const m = await client.fetchMarketById(marketId);
+      // weight = max(reserveYes,reserveNo) > total_shares now; a 1-unit add floors to 0.
+      assert.isTrue(
+        Math.max(m.reserveYes.toNumber(), m.reserveNo.toNumber()) > m.totalShares.toNumber(),
+        "weight should exceed total_shares"
+      );
+      const msg = await sendExpectFail(
+        await client.addLiquidityIxs(user2.publicKey, marketId, new BN(1), usdcMint),
+        user2
+      );
+      assert.match(msg, /ZeroAmount/);
+    });
+  });
 });

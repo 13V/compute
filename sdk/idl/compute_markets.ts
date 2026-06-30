@@ -57,6 +57,151 @@ export type ComputeMarkets = {
       "args": []
     },
     {
+      "name": "addLiquidity",
+      "docs": [
+        "Add liquidity to an already-seeded, OPEN market (Gnosis FPMM `addFunding`).",
+        "",
+        "The provider deposits `amount` collateral; the protocol mints a full set",
+        "(`amount` YES + `amount` NO) into the pool and sends back the surplus of",
+        "each side so the **price ratio is preserved**. Shares are minted pro-rata",
+        "to `amount / max(reserve_yes, reserve_no)`.",
+        "",
+        "Rounding (favors the pool / existing LPs):",
+        "* `shares_minted` is FLOORED — the entrant is never over-credited.",
+        "* the reserve the pool keeps of each side is CEILED — the send-back to the",
+        "LP is the smaller value, so the pool retains at least its fair share.",
+        "A dust add that would mint 0 shares is rejected (`ZeroAmount`)."
+      ],
+      "discriminator": [
+        181,
+        157,
+        89,
+        67,
+        143,
+        182,
+        52,
+        72
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "yesMint",
+          "writable": true
+        },
+        {
+          "name": "noMint",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "poolYes",
+          "writable": true
+        },
+        {
+          "name": "poolNo",
+          "writable": true
+        },
+        {
+          "name": "lpCollateral",
+          "writable": true
+        },
+        {
+          "name": "lpYes",
+          "writable": true
+        },
+        {
+          "name": "lpNo",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "lp"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lp",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "buy",
       "docs": [
         "Buy `outcome` by investing `collateral_in`. Reverts if fewer than",
@@ -171,9 +316,17 @@ export type ComputeMarkets = {
     {
       "name": "claimPool",
       "docs": [
-        "After settlement, the LP reclaims the pool's outcome tokens as collateral:",
-        "the winning-side reserve on a YES/NO resolution, or half of each reserve on",
-        "a void."
+        "After settlement, a liquidity provider reclaims their **pro-rata slice** of",
+        "the pool's outcome tokens as collateral. Claims the caller's ENTIRE",
+        "position: with `shares = position.shares` and `S = total_shares`, the",
+        "provider's slice of each reserve is `c_i = floor(reserve_i * shares / S)`",
+        "(FLOORED so leftover dust stays with un-claimed providers / the vault).",
+        "Payout per settlement state:",
+        "* binary RESOLVED → the winning side's slice (`cy` if YES won, else `cn`);",
+        "* scalar RESOLVED → `scalar_payout(cy, f, LONG) + scalar_payout(cn, f, SHORT)`;",
+        "* VOID → `cy/2 + cn/2`.",
+        "Burns `cy`/`cn` from the pools, transfers `payout` collateral out, and",
+        "zeroes the caller's shares (and decrements `total_shares`)."
       ],
       "discriminator": [
         70,
@@ -233,6 +386,33 @@ export type ComputeMarkets = {
         {
           "name": "lpCollateral",
           "writable": true
+        },
+        {
+          "name": "position",
+          "docs": [
+            "The caller's own position (seeds bind it to `market` + `lp`), so each LP",
+            "claims exactly their pro-rata slice."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "lp"
+              }
+            ]
+          }
         },
         {
           "name": "lp",
@@ -1183,6 +1363,135 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "removeLiquidity",
+      "docs": [
+        "Remove liquidity from an OPEN market (Gnosis FPMM `removeFunding`).",
+        "",
+        "Burns `shares` of the caller's pool position and transfers their pro-rata",
+        "slice of each reserve out to the LP's outcome ATAs:",
+        "`send_i = floor(reserve_i * shares / total_shares)` (FLOORED so remaining",
+        "LPs are never short-changed). Collateral is unchanged — the outcome tokens",
+        "stay outstanding, just held by the LP, who can later merge equal YES+NO via",
+        "`sell` / redemption or hold to settlement."
+      ],
+      "discriminator": [
+        80,
+        85,
+        209,
+        72,
+        24,
+        206,
+        177,
+        108
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "poolYes",
+          "writable": true
+        },
+        {
+          "name": "poolNo",
+          "writable": true
+        },
+        {
+          "name": "lpYes",
+          "writable": true
+        },
+        {
+          "name": "lpNo",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "lp"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner",
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "lp",
+          "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "shares",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "seedLiquidity",
       "docs": [
         "Seed the AMM with initial liquidity at 50/50 odds. Callable once, by the",
@@ -1305,6 +1614,29 @@ export type ComputeMarkets = {
         {
           "name": "lpCollateral",
           "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "lp"
+              }
+            ]
+          }
         },
         {
           "name": "lp",
@@ -1695,6 +2027,19 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "liquidityPosition",
+      "discriminator": [
+        153,
+        56,
+        106,
+        34,
+        55,
+        42,
+        113,
+        176
+      ]
+    },
+    {
       "name": "market",
       "discriminator": [
         219,
@@ -1733,6 +2078,32 @@ export type ComputeMarkets = {
         178,
         254,
         8
+      ]
+    },
+    {
+      "name": "liquidityAdded",
+      "discriminator": [
+        154,
+        26,
+        221,
+        108,
+        238,
+        64,
+        217,
+        161
+      ]
+    },
+    {
+      "name": "liquidityRemoved",
+      "discriminator": [
+        225,
+        105,
+        216,
+        39,
+        124,
+        116,
+        169,
+        189
       ]
     },
     {
@@ -1950,111 +2321,116 @@ export type ComputeMarkets = {
     },
     {
       "code": 6011,
+      "name": "insufficientShares",
+      "msg": "Insufficient pool shares for this operation"
+    },
+    {
+      "code": 6012,
       "name": "invalidOutcome",
       "msg": "Invalid outcome (must be 0=YES or 1=NO)"
     },
     {
-      "code": 6012,
+      "code": 6013,
       "name": "unauthorized",
       "msg": "unauthorized"
     },
     {
-      "code": 6013,
+      "code": 6014,
       "name": "wrongMint",
       "msg": "Wrong token mint for this account"
     },
     {
-      "code": 6014,
+      "code": 6015,
       "name": "wrongOwner",
       "msg": "Wrong owner for this token account"
     },
     {
-      "code": 6015,
+      "code": 6016,
       "name": "slippageExceeded",
       "msg": "Slippage tolerance exceeded"
     },
     {
-      "code": 6016,
+      "code": 6017,
       "name": "insufficientLiquidity",
       "msg": "Insufficient liquidity for this trade"
     },
     {
-      "code": 6017,
+      "code": 6018,
       "name": "notResolved",
       "msg": "Market has not been resolved yet"
     },
     {
-      "code": 6018,
+      "code": 6019,
       "name": "notProposed",
       "msg": "No outcome has been proposed"
     },
     {
-      "code": 6019,
+      "code": 6020,
       "name": "notVoid",
       "msg": "Market is not voided"
     },
     {
-      "code": 6020,
+      "code": 6021,
       "name": "disputeWindowOpen",
       "msg": "Dispute window is still open"
     },
     {
-      "code": 6021,
+      "code": 6022,
       "name": "disputeWindowClosed",
       "msg": "Dispute window has closed"
     },
     {
-      "code": 6022,
+      "code": 6023,
       "name": "tooEarlyToResolve",
       "msg": "Too early to resolve this market"
     },
     {
-      "code": 6023,
+      "code": 6024,
       "name": "tooEarlyToVoid",
       "msg": "Too early to void this market"
     },
     {
-      "code": 6024,
+      "code": 6025,
       "name": "nothingToClaim",
       "msg": "Nothing to claim"
     },
     {
-      "code": 6025,
+      "code": 6026,
       "name": "wrongResolverKind",
       "msg": "Wrong resolver kind for this instruction"
     },
     {
-      "code": 6026,
+      "code": 6027,
       "name": "wrongMarketKind",
       "msg": "Wrong market kind for this instruction"
     },
     {
-      "code": 6027,
+      "code": 6028,
       "name": "unsupportedMarketKind",
       "msg": "Unsupported market kind"
     },
     {
-      "code": 6028,
+      "code": 6029,
       "name": "invalidScalarRange",
       "msg": "Invalid scalar range (need lower_bound < upper_bound)"
     },
     {
-      "code": 6029,
+      "code": 6030,
       "name": "invalidComparison",
       "msg": "Invalid oracle comparison code"
     },
     {
-      "code": 6030,
+      "code": 6031,
       "name": "feedHasNoValue",
       "msg": "Price feed has no published value yet"
     },
     {
-      "code": 6031,
+      "code": 6032,
       "name": "staleFeed",
       "msg": "Price feed value is too stale to resolve"
     },
     {
-      "code": 6032,
+      "code": 6033,
       "name": "mathOverflow",
       "msg": "Arithmetic overflow"
     }
@@ -2115,6 +2491,88 @@ export type ComputeMarkets = {
           },
           {
             "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityAdded",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "provider",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "sharesMinted",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPosition",
+      "docs": [
+        "One liquidity provider's pool position in one market. PDA seeds",
+        "`[LP_SEED, market, owner]`. `shares / market.total_shares` is the provider's",
+        "fraction of the AMM reserves; created on `seed_liquidity` (the creator) or the",
+        "provider's first `add_liquidity`, and drained to 0 by `claim_pool`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityRemoved",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "provider",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "yesOut",
+            "type": "u64"
+          },
+          {
+            "name": "noOut",
             "type": "u64"
           }
         ]
@@ -2247,10 +2705,18 @@ export type ComputeMarkets = {
           },
           {
             "name": "lp",
+            "docs": [
+              "The initial liquidity provider (informational; the creator who seeded).",
+              "Per-provider balances live in [`LiquidityPosition`] PDAs."
+            ],
             "type": "pubkey"
           },
           {
-            "name": "lpShares",
+            "name": "totalShares",
+            "docs": [
+              "Total pool shares outstanding across all providers. A provider owns",
+              "`position.shares / total_shares` of the AMM reserves."
+            ],
             "type": "u64"
           },
           {
@@ -2437,6 +2903,16 @@ export type ComputeMarkets = {
           },
           {
             "name": "lp",
+            "docs": [
+              "The signer who claimed (kept for compatibility)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "provider",
+            "docs": [
+              "The position owner whose shares were claimed (== `lp`)."
+            ],
             "type": "pubkey"
           },
           {

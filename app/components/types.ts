@@ -19,7 +19,7 @@ export interface MarketAccount {
   reserveYes: BN;
   reserveNo: BN;
   lp: PublicKey;
-  lpShares: BN;
+  totalShares: BN;
   collateral: BN;
   feeAccrued: BN;
   state: number;

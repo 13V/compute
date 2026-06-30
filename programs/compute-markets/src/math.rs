@@ -233,6 +233,90 @@ pub fn scalar_payout(amount: u64, fraction_micro: u32, is_long: bool) -> u64 {
     payout as u64
 }
 
+// ----------------------------- Liquidity provider (LP) share math -----------------------------
+//
+// Multi-LP pooling follows the Gnosis FPMM `addFunding` / `removeFunding` design.
+// Pool shares track each provider's pro-rata claim on the AMM reserves. ALL
+// rounding here is chosen to favor the pool / existing LPs and never the entrant
+// or remover, mirroring the trade rounding policy above.
+//
+// * Adding funding: the new LP deposits `amount` collateral, the protocol mints a
+//   full set (`amount` of each outcome) into the pool, then sends back the surplus
+//   of each side so the **price ratio is preserved**. Shares minted are
+//   proportional to `amount / pool_weight`, FLOORED — the entrant never gets more
+//   shares than fair.
+// * Removing / claiming: a provider's slice of each reserve is
+//   `reserve_i * shares / total_shares`, FLOORED — the remover never pulls more
+//   than fair, so leftover dust stays with the remaining LPs / the pool.
+
+/// Pool weight used to price `add_liquidity`: the larger of the two reserves.
+/// (Gnosis uses `max(reserves)` as the funding denominator.)
+#[inline]
+pub fn pool_weight(reserve_yes: u64, reserve_no: u64) -> u64 {
+    reserve_yes.max(reserve_no)
+}
+
+/// Pool shares minted for an `add_liquidity(amount)` against an existing pool.
+///
+/// `shares_minted = floor(amount * total_shares / pool_weight)`.
+///
+/// FLOORED so a new LP is never credited more shares than their pro-rata deposit
+/// warrants (favoring existing LPs). Returns `None` on overflow or when
+/// `pool_weight == 0` (an unseeded pool — callers reject that earlier).
+pub fn lp_shares_minted(amount: u64, total_shares: u64, pool_weight: u64) -> Option<u64> {
+    if pool_weight == 0 {
+        return None;
+    }
+    let minted = (amount as u128)
+        .checked_mul(total_shares as u128)?
+        .checked_div(pool_weight as u128)?;
+    u64::try_from(minted).ok()
+}
+
+/// Collateral the pool KEEPS of one side on an `add_liquidity`, rounded UP
+/// (`ceil`). The full set minted in is `amount` per side; the pool keeps
+/// `ceil(amount * reserve_i / pool_weight)` and the rest is sent back to the LP.
+///
+/// Ceiling the kept amount means the LP's send-back is the SMALLER value, so the
+/// pool retains at least its fair share (favoring existing LPs). `reserve_i <=
+/// pool_weight`, so the result never exceeds `amount` and the send-back is
+/// non-negative. Returns `None` on overflow or `pool_weight == 0`.
+pub fn lp_add_keep(amount: u64, reserve_side: u64, pool_weight: u64) -> Option<u64> {
+    if pool_weight == 0 {
+        return None;
+    }
+    let keep = ceil_div(
+        (amount as u128).checked_mul(reserve_side as u128)?,
+        pool_weight as u128,
+    );
+    u64::try_from(keep).ok()
+}
+
+/// Outcome tokens sent back to the LP for one side on an `add_liquidity`:
+/// `amount - lp_add_keep(...)`. Always `>= 0` because `reserve_side <=
+/// pool_weight` implies `keep <= amount`. Returns `None` on overflow.
+pub fn lp_add_sendback(amount: u64, reserve_side: u64, pool_weight: u64) -> Option<u64> {
+    let keep = lp_add_keep(amount, reserve_side, pool_weight)?;
+    amount.checked_sub(keep)
+}
+
+/// A provider's pro-rata slice of one reserve given their `shares` out of
+/// `total_shares`: `floor(reserve_side * shares / total_shares)`.
+///
+/// FLOORED so a remover / claimer never pulls more than their fair fraction;
+/// leftover dust stays with the remaining LPs (or the pool). Used by both
+/// `remove_liquidity` and `claim_pool`. Returns `None` on overflow or when
+/// `total_shares == 0` (callers reject that earlier).
+pub fn lp_slice(reserve_side: u64, shares: u64, total_shares: u64) -> Option<u64> {
+    if total_shares == 0 {
+        return None;
+    }
+    let slice = (reserve_side as u128)
+        .checked_mul(shares as u128)?
+        .checked_div(total_shares as u128)?;
+    u64::try_from(slice).ok()
+}
+
 /// Oracle comparison: YES iff the feed value is `>=` the strike.
 pub const CMP_GTE: u8 = 0;
 /// Oracle comparison: YES iff the feed value is `<=` the strike.
@@ -413,6 +497,47 @@ mod tests {
     }
 
     #[test]
+    fn lp_share_math_basic() {
+        // Seeded 1000/1000, total_shares == 1000 (== seed amount). Weight = 1000.
+        let w = pool_weight(1_000, 1_000);
+        assert_eq!(w, 1_000);
+        // Adding 1000 against a balanced 1000/1000 pool mints 1000 shares (doubles
+        // the pool) and sends back 0 of each side (full set is kept on both).
+        assert_eq!(lp_shares_minted(1_000, 1_000, w).unwrap(), 1_000);
+        assert_eq!(lp_add_sendback(1_000, 1_000, w).unwrap(), 0);
+
+        // Skewed pool 2000 YES / 1000 NO (YES cheaper). Weight = 2000.
+        let w = pool_weight(2_000, 1_000);
+        assert_eq!(w, 2_000);
+        // Add 2000: mint 2000 of each side in; pool keeps all 2000 YES (the heavy
+        // side) and ceil(2000*1000/2000)=1000 NO, sending back 1000 NO. Shares
+        // minted = 2000*total/2000 = total (doubles).
+        assert_eq!(lp_add_keep(2_000, 2_000, w).unwrap(), 2_000); // YES kept
+        assert_eq!(lp_add_sendback(2_000, 2_000, w).unwrap(), 0); // YES sendback
+        assert_eq!(lp_add_keep(2_000, 1_000, w).unwrap(), 1_000); // NO kept
+        assert_eq!(lp_add_sendback(2_000, 1_000, w).unwrap(), 1_000); // NO sendback
+
+        // Pro-rata slice: half the shares pulls (floored) half of each reserve.
+        assert_eq!(lp_slice(1_000, 500, 1_000).unwrap(), 500);
+        assert_eq!(lp_slice(999, 500, 1_000).unwrap(), 499); // floor, not 499.5
+    }
+
+    #[test]
+    fn lp_add_keep_ceils_in_pool_favor() {
+        // amount*reserve/weight = 3*1/2 = 1.5 -> keep ceils to 2, sendback = 1.
+        // (Flooring would keep 1 and send back 2, leaking value to the entrant.)
+        assert_eq!(lp_add_keep(3, 1, 2).unwrap(), 2);
+        assert_eq!(lp_add_sendback(3, 1, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn lp_share_math_rejects_degenerate() {
+        assert!(lp_shares_minted(100, 1_000, 0).is_none()); // zero weight
+        assert!(lp_add_keep(100, 50, 0).is_none());
+        assert!(lp_slice(100, 50, 0).is_none()); // zero total shares
+    }
+
+    #[test]
     fn fee_math() {
         assert_eq!(fee_amount(1_000_000, 100).unwrap(), 10_000); // 1%
         assert_eq!(fee_amount(1_000_000, 0).unwrap(), 0);
@@ -515,6 +640,88 @@ mod tests {
             // No-overpay / conservation: the two halves of one position never
             // redeem for more than the collateral that backs it.
             prop_assert!(long as u128 + short as u128 <= amount as u128);
+        }
+
+        // LP add-funding rounding favors the pool: shares are floored (entrant
+        // never over-credited) and the kept reserve is ceiled / send-back floored
+        // (pool keeps at least its fair share). Reserves stay within the trade
+        // envelope so the u128 products are exercised but never overflow.
+        #[test]
+        fn prop_lp_add_rounding_favors_pool(
+            ry in 1u64..RMAX,
+            rn in 1u64..RMAX,
+            amount in 1u64..1_000_000_000_000u64,
+        ) {
+            let w = pool_weight(ry, rn);
+            prop_assume!(w > 0);
+            let total = w; // the seed-equivalent: total_shares == weight at seed.
+            if let Some(minted) = lp_shares_minted(amount, total, w) {
+                // Shares minted are floored: minted * w <= amount * total.
+                prop_assert!((minted as u128) * (w as u128) <= (amount as u128) * (total as u128));
+            }
+            for &r in &[ry, rn] {
+                let keep = lp_add_keep(amount, r, w).unwrap();
+                let sendback = lp_add_sendback(amount, r, w).unwrap();
+                // Accounting closes and send-back is non-negative (r <= w).
+                prop_assert_eq!(keep + sendback, amount);
+                // Pool keeps AT LEAST the exact fair share (ceil): keep*w >= amount*r.
+                prop_assert!((keep as u128) * (w as u128) >= (amount as u128) * (r as u128));
+            }
+        }
+
+        // No value extraction: add `amount`, then immediately remove ALL minted
+        // shares. The LP gets back `sendback` outcome tokens (kept at add time)
+        // plus the pro-rata slice pulled at remove time. Their TOTAL mergeable
+        // value (min of the two sides they can pair into collateral) plus the
+        // leftover unmatched single-side tokens can never let them reconstruct
+        // more than the `amount` collateral they deposited — concretely, the
+        // collateral they can mint by merging full YES+NO sets is <= amount.
+        #[test]
+        fn prop_lp_add_then_remove_no_profit(
+            ry in 1_000u64..RMAX,
+            rn in 1_000u64..RMAX,
+            amount in 1u64..1_000_000_000u64,
+        ) {
+            let w = pool_weight(ry, rn);
+            prop_assume!(w > 0);
+            let total = w;
+            let minted = match lp_shares_minted(amount, total, w) {
+                Some(m) if m > 0 => m,
+                _ => return Ok(()),
+            };
+            // Tokens kept at add time (the send-back of each side).
+            let sb_yes = lp_add_sendback(amount, ry, w).unwrap();
+            let sb_no = lp_add_sendback(amount, rn, w).unwrap();
+            // Reserves AFTER the add: r + amount - sendback == r + keep.
+            let new_ry = ry + amount - sb_yes;
+            let new_rn = rn + amount - sb_no;
+            let new_total = total + minted;
+            // Tokens pulled at remove time (pro-rata slice of the new reserves).
+            let pull_yes = lp_slice(new_ry, minted, new_total).unwrap();
+            let pull_no = lp_slice(new_rn, minted, new_total).unwrap();
+            // The LP now holds these YES and NO tokens; merging full sets yields
+            // `min(total_yes, total_no)` collateral. That must not exceed `amount`.
+            let total_yes = sb_yes as u128 + pull_yes as u128;
+            let total_no = sb_no as u128 + pull_no as u128;
+            let mergeable = total_yes.min(total_no);
+            prop_assert!(mergeable <= amount as u128,
+                "round-trip profit: merged {} > deposited {}", mergeable, amount);
+        }
+
+        // Sum of all LPs' pro-rata slices never exceeds the reserve (flooring
+        // means leftover dust stays in the pool): for a two-LP split of the share
+        // pool, slice(a) + slice(b) <= reserve.
+        #[test]
+        fn prop_lp_slices_never_over_pool(
+            reserve in 0u64..RMAX,
+            total in 1u64..RMAX,
+            shares_a in 0u64..RMAX,
+        ) {
+            let a = shares_a.min(total);
+            let b = total - a;
+            let sa = lp_slice(reserve, a, total).unwrap();
+            let sb = lp_slice(reserve, b, total).unwrap();
+            prop_assert!(sa as u128 + sb as u128 <= reserve as u128);
         }
     }
 }

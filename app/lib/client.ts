@@ -20,6 +20,7 @@ import {
   configPda,
   deriveMarketAccounts,
   marketPda,
+  liquidityPositionPda,
   OUTCOME_YES,
   MARKET_BINARY,
 } from "./pdas";
@@ -157,6 +158,7 @@ export class ComputeClient {
     const [config] = configPda(this.programId);
     const a = deriveMarketAccounts(marketId, this.programId);
     const lpCollateral = getAssociatedTokenAddressSync(collateralMint, lp);
+    const [position] = liquidityPositionPda(a.market, lp, this.programId);
     return this.program.methods
       .seedLiquidity(amount)
       .accountsPartial({
@@ -168,12 +170,99 @@ export class ComputeClient {
         poolYes: a.poolYes,
         poolNo: a.poolNo,
         lpCollateral,
+        position,
         lp,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
         rent: SYSVAR_RENT_PUBKEY,
       })
       .instruction();
+  }
+
+  /**
+   * Add liquidity to an already-seeded market (Gnosis FPMM `addFunding`). Returns
+   * `[ensureYesAtaIx, ensureNoAtaIx, addLiquidityIx]` so the LP's outcome ATAs
+   * (which receive the price-preserving send-back) always exist.
+   */
+  async addLiquidityIxs(
+    lp: PublicKey,
+    marketId: number | BN,
+    amount: BN,
+    collateralMint: PublicKey
+  ): Promise<TransactionInstruction[]> {
+    const [config] = configPda(this.programId);
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const lpCollateral = getAssociatedTokenAddressSync(collateralMint, lp);
+    const lpYes = getAssociatedTokenAddressSync(a.yesMint, lp);
+    const lpNo = getAssociatedTokenAddressSync(a.noMint, lp);
+    const [position] = liquidityPositionPda(a.market, lp, this.programId);
+    const ataYesIx = createAssociatedTokenAccountIdempotentInstruction(lp, lpYes, lp, a.yesMint);
+    const ataNoIx = createAssociatedTokenAccountIdempotentInstruction(lp, lpNo, lp, a.noMint);
+    const ix = await this.program.methods
+      .addLiquidity(amount)
+      .accountsPartial({
+        config,
+        market: a.market,
+        yesMint: a.yesMint,
+        noMint: a.noMint,
+        vault: a.vault,
+        poolYes: a.poolYes,
+        poolNo: a.poolNo,
+        lpCollateral,
+        lpYes,
+        lpNo,
+        position,
+        lp,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+    return [ataYesIx, ataNoIx, ix];
+  }
+
+  /**
+   * Remove `shares` of pool liquidity (Gnosis FPMM `removeFunding`). Returns
+   * `[ensureYesAtaIx, ensureNoAtaIx, removeLiquidityIx]` so the LP's outcome ATAs
+   * (which receive the withdrawn YES/NO) always exist.
+   */
+  async removeLiquidityIxs(
+    lp: PublicKey,
+    marketId: number | BN,
+    shares: BN
+  ): Promise<TransactionInstruction[]> {
+    const [config] = configPda(this.programId);
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const lpYes = getAssociatedTokenAddressSync(a.yesMint, lp);
+    const lpNo = getAssociatedTokenAddressSync(a.noMint, lp);
+    const [position] = liquidityPositionPda(a.market, lp, this.programId);
+    const ataYesIx = createAssociatedTokenAccountIdempotentInstruction(lp, lpYes, lp, a.yesMint);
+    const ataNoIx = createAssociatedTokenAccountIdempotentInstruction(lp, lpNo, lp, a.noMint);
+    const ix = await this.program.methods
+      .removeLiquidity(shares)
+      .accountsPartial({
+        config,
+        market: a.market,
+        poolYes: a.poolYes,
+        poolNo: a.poolNo,
+        lpYes,
+        lpNo,
+        position,
+        owner: lp,
+        lp,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+    return [ataYesIx, ataNoIx, ix];
+  }
+
+  /** Fetch a provider's liquidity position (or null if it doesn't exist yet). */
+  async fetchLiquidityPosition(market: PublicKey, owner: PublicKey) {
+    const [position] = liquidityPositionPda(market, owner, this.programId);
+    try {
+      return await this.program.account.liquidityPosition.fetch(position);
+    } catch {
+      return null;
+    }
   }
 
   // ----- trading -----
@@ -360,6 +449,7 @@ export class ComputeClient {
   async claimPoolIx(lp: PublicKey, marketId: number | BN, collateralMint: PublicKey) {
     const a = deriveMarketAccounts(marketId, this.programId);
     const lpCollateral = getAssociatedTokenAddressSync(collateralMint, lp);
+    const [position] = liquidityPositionPda(a.market, lp, this.programId);
     return this.program.methods
       .claimPool()
       .accountsPartial({
@@ -370,6 +460,7 @@ export class ComputeClient {
         poolNo: a.poolNo,
         vault: a.vault,
         lpCollateral,
+        position,
         lp,
         tokenProgram: TOKEN_PROGRAM_ID,
       })

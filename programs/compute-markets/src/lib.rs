@@ -90,6 +90,8 @@ pub const NO_SEED: &[u8] = b"no";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const POOL_YES_SEED: &[u8] = b"pool_yes";
 pub const POOL_NO_SEED: &[u8] = b"pool_no";
+/// Per-provider liquidity-position PDA seed: `[LP_SEED, market, owner]`.
+pub const LP_SEED: &[u8] = b"lp";
 
 /// One side of a binary market. Centralizes the YES/NO ↔ reserve mapping so the
 /// trade handlers never hand-mirror branches (a transposed branch would be a
@@ -232,7 +234,7 @@ pub mod compute_markets {
         market.reserve_yes = 0;
         market.reserve_no = 0;
         market.lp = Pubkey::default();
-        market.lp_shares = 0;
+        market.total_shares = 0;
         market.collateral = 0;
         market.fee_accrued = 0;
         market.state = STATE_OPEN;
@@ -279,10 +281,17 @@ pub mod compute_markets {
         market.pool_yes = ctx.accounts.pool_yes.key();
         market.pool_no = ctx.accounts.pool_no.key();
         market.lp = ctx.accounts.lp.key();
-        market.lp_shares = amount;
+        // The creator starts with 100% of the pool: total_shares == their shares.
+        market.total_shares = amount;
         market.reserve_yes = amount;
         market.reserve_no = amount;
         market.collateral = amount;
+
+        let position = &mut ctx.accounts.position;
+        position.market = market.key();
+        position.owner = ctx.accounts.lp.key();
+        position.shares = amount;
+        position.bump = ctx.bumps.position;
 
         token::transfer(
             CpiContext::new(
@@ -328,6 +337,245 @@ pub mod compute_markets {
         emit!(LiquiditySeeded {
             market: market.key(),
             amount
+        });
+        Ok(())
+    }
+
+    /// Add liquidity to an already-seeded, OPEN market (Gnosis FPMM `addFunding`).
+    ///
+    /// The provider deposits `amount` collateral; the protocol mints a full set
+    /// (`amount` YES + `amount` NO) into the pool and sends back the surplus of
+    /// each side so the **price ratio is preserved**. Shares are minted pro-rata
+    /// to `amount / max(reserve_yes, reserve_no)`.
+    ///
+    /// Rounding (favors the pool / existing LPs):
+    /// * `shares_minted` is FLOORED — the entrant is never over-credited.
+    /// * the reserve the pool keeps of each side is CEILED — the send-back to the
+    ///   LP is the smaller value, so the pool retains at least its fair share.
+    /// A dust add that would mint 0 shares is rejected (`ZeroAmount`).
+    pub fn add_liquidity(ctx: Context<AddLiquidity>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.config.paused, ErrorCode::Paused);
+        require!(amount > 0, ErrorCode::ZeroAmount);
+
+        let market = &mut ctx.accounts.market;
+        require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        require!(
+            market.reserve_yes > 0 && market.reserve_no > 0,
+            ErrorCode::NoLiquidity
+        );
+        require!(market.total_shares > 0, ErrorCode::NoLiquidity);
+
+        let r_yes = market.reserve_yes;
+        let r_no = market.reserve_no;
+        let total = market.total_shares;
+        let weight = math::pool_weight(r_yes, r_no);
+
+        let shares_minted =
+            math::lp_shares_minted(amount, total, weight).ok_or(ErrorCode::MathOverflow)?;
+        // Reject dust adds that would mint 0 shares (would be free outcome tokens).
+        require!(shares_minted > 0, ErrorCode::ZeroAmount);
+
+        let sendback_yes =
+            math::lp_add_sendback(amount, r_yes, weight).ok_or(ErrorCode::MathOverflow)?;
+        let sendback_no =
+            math::lp_add_sendback(amount, r_no, weight).ok_or(ErrorCode::MathOverflow)?;
+
+        // 1. Pull `amount` collateral from the LP into the vault.
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.lp_collateral.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.lp.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        market.collateral = market
+            .collateral
+            .checked_add(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let id_bytes = market.market_id.to_le_bytes();
+        let bump_seed = [market.bump];
+        let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        // 2. Mint a full set (`amount` of each outcome) into the pools.
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.yes_mint.to_account_info(),
+                    to: ctx.accounts.pool_yes.to_account_info(),
+                    authority: market.to_account_info(),
+                },
+                signer,
+            ),
+            amount,
+        )?;
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.no_mint.to_account_info(),
+                    to: ctx.accounts.pool_no.to_account_info(),
+                    authority: market.to_account_info(),
+                },
+                signer,
+            ),
+            amount,
+        )?;
+
+        // 3. Send the surplus of each side back to the LP (price-ratio preserving).
+        if sendback_yes > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.pool_yes.to_account_info(),
+                        to: ctx.accounts.lp_yes.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                sendback_yes,
+            )?;
+        }
+        if sendback_no > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.pool_no.to_account_info(),
+                        to: ctx.accounts.lp_no.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                sendback_no,
+            )?;
+        }
+
+        // 4. New reserves: r_i + amount - sendback_i (== r_i + keep_i). Update
+        //    share bookkeeping.
+        market.reserve_yes = r_yes
+            .checked_add(amount)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_sub(sendback_yes)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.reserve_no = r_no
+            .checked_add(amount)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_sub(sendback_no)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.total_shares = total
+            .checked_add(shares_minted)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let position = &mut ctx.accounts.position;
+        position.market = market.key();
+        position.owner = ctx.accounts.lp.key();
+        position.shares = position
+            .shares
+            .checked_add(shares_minted)
+            .ok_or(ErrorCode::MathOverflow)?;
+        if position.bump == 0 {
+            position.bump = ctx.bumps.position;
+        }
+
+        emit!(LiquidityAdded {
+            market: market.key(),
+            provider: ctx.accounts.lp.key(),
+            amount,
+            shares_minted,
+        });
+        Ok(())
+    }
+
+    /// Remove liquidity from an OPEN market (Gnosis FPMM `removeFunding`).
+    ///
+    /// Burns `shares` of the caller's pool position and transfers their pro-rata
+    /// slice of each reserve out to the LP's outcome ATAs:
+    /// `send_i = floor(reserve_i * shares / total_shares)` (FLOORED so remaining
+    /// LPs are never short-changed). Collateral is unchanged — the outcome tokens
+    /// stay outstanding, just held by the LP, who can later merge equal YES+NO via
+    /// `sell` / redemption or hold to settlement.
+    pub fn remove_liquidity(ctx: Context<RemoveLiquidity>, shares: u64) -> Result<()> {
+        require!(!ctx.accounts.config.paused, ErrorCode::Paused);
+        require!(shares > 0, ErrorCode::ZeroAmount);
+
+        let market = &mut ctx.accounts.market;
+        require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        require!(
+            shares <= ctx.accounts.position.shares,
+            ErrorCode::InsufficientShares
+        );
+
+        let total = market.total_shares;
+        require!(total > 0, ErrorCode::NoLiquidity);
+        let send_yes =
+            math::lp_slice(market.reserve_yes, shares, total).ok_or(ErrorCode::MathOverflow)?;
+        let send_no =
+            math::lp_slice(market.reserve_no, shares, total).ok_or(ErrorCode::MathOverflow)?;
+
+        let id_bytes = market.market_id.to_le_bytes();
+        let bump_seed = [market.bump];
+        let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        if send_yes > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.pool_yes.to_account_info(),
+                        to: ctx.accounts.lp_yes.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                send_yes,
+            )?;
+        }
+        if send_no > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.pool_no.to_account_info(),
+                        to: ctx.accounts.lp_no.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                send_no,
+            )?;
+        }
+
+        market.reserve_yes = market
+            .reserve_yes
+            .checked_sub(send_yes)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.reserve_no = market
+            .reserve_no
+            .checked_sub(send_no)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.total_shares = total.checked_sub(shares).ok_or(ErrorCode::MathOverflow)?;
+
+        let position = &mut ctx.accounts.position;
+        position.shares = position
+            .shares
+            .checked_sub(shares)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        emit!(LiquidityRemoved {
+            market: market.key(),
+            provider: ctx.accounts.lp.key(),
+            shares,
+            yes_out: send_yes,
+            no_out: send_no,
         });
         Ok(())
     }
@@ -1085,16 +1333,23 @@ pub mod compute_markets {
         Ok(())
     }
 
-    /// After settlement, the LP reclaims the pool's outcome tokens as collateral:
-    /// the winning-side reserve on a YES/NO resolution, or half of each reserve on
-    /// a void.
+    /// After settlement, a liquidity provider reclaims their **pro-rata slice** of
+    /// the pool's outcome tokens as collateral. Claims the caller's ENTIRE
+    /// position: with `shares = position.shares` and `S = total_shares`, the
+    /// provider's slice of each reserve is `c_i = floor(reserve_i * shares / S)`
+    /// (FLOORED so leftover dust stays with un-claimed providers / the vault).
+    /// Payout per settlement state:
+    /// * binary RESOLVED → the winning side's slice (`cy` if YES won, else `cn`);
+    /// * scalar RESOLVED → `scalar_payout(cy, f, LONG) + scalar_payout(cn, f, SHORT)`;
+    /// * VOID → `cy/2 + cn/2`.
+    /// Burns `cy`/`cn` from the pools, transfers `payout` collateral out, and
+    /// zeroes the caller's shares (and decrements `total_shares`).
     pub fn claim_pool(ctx: Context<ClaimPool>) -> Result<()> {
         let market = &mut ctx.accounts.market;
         require!(
             market.state == STATE_RESOLVED || market.state == STATE_VOID,
             ErrorCode::NotResolved
         );
-        require!(ctx.accounts.lp.key() == market.lp, ErrorCode::Unauthorized);
         require_keys_eq!(
             ctx.accounts.yes_mint.key(),
             market.yes_mint,
@@ -1106,121 +1361,84 @@ pub mod compute_markets {
             ErrorCode::WrongMint
         );
 
+        // The caller claims their full position (the `position` PDA is bound to
+        // `lp` + `market` by its seeds in the accounts context).
+        let shares = ctx.accounts.position.shares;
+        require!(shares > 0, ErrorCode::NothingToClaim);
+        let total = market.total_shares;
+        require!(total > 0, ErrorCode::NothingToClaim);
+
+        // This provider's slice of each reserve (floored => favors the pool /
+        // remaining LPs).
+        let cy =
+            math::lp_slice(market.reserve_yes, shares, total).ok_or(ErrorCode::MathOverflow)?;
+        let cn = math::lp_slice(market.reserve_no, shares, total).ok_or(ErrorCode::MathOverflow)?;
+
         let id_bytes = market.market_id.to_le_bytes();
         let bump_seed = [market.bump];
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
         let signer: &[&[&[u8]]] = &[seeds];
 
         let payout: u64 = if market.state == STATE_RESOLVED && market.market_kind == MARKET_SCALAR {
-            // Scalar: the pool holds `reserve_yes` LONG and `reserve_no` SHORT,
-            // each settling at the resolved fraction (LONG at f, SHORT at 1 - f).
-            let ry = market.reserve_yes;
-            let rn = market.reserve_no;
-            require!(ry > 0 || rn > 0, ErrorCode::NothingToClaim);
+            // Scalar: the slice of each side settles at the resolved fraction
+            // (LONG at f, SHORT at 1 - f).
             let f = market.settlement_fraction;
-            let lp_payout = math::scalar_payout(ry, f, true)
-                .checked_add(math::scalar_payout(rn, f, false))
-                .ok_or(ErrorCode::MathOverflow)?;
-            if ry > 0 {
-                token::burn(
-                    CpiContext::new_with_signer(
-                        ctx.accounts.token_program.to_account_info(),
-                        Burn {
-                            mint: ctx.accounts.yes_mint.to_account_info(),
-                            from: ctx.accounts.pool_yes.to_account_info(),
-                            authority: market.to_account_info(),
-                        },
-                        signer,
-                    ),
-                    ry,
-                )?;
-            }
-            if rn > 0 {
-                token::burn(
-                    CpiContext::new_with_signer(
-                        ctx.accounts.token_program.to_account_info(),
-                        Burn {
-                            mint: ctx.accounts.no_mint.to_account_info(),
-                            from: ctx.accounts.pool_no.to_account_info(),
-                            authority: market.to_account_info(),
-                        },
-                        signer,
-                    ),
-                    rn,
-                )?;
-            }
-            market.reserve_yes = 0;
-            market.reserve_no = 0;
-            lp_payout
+            math::scalar_payout(cy, f, true)
+                .checked_add(math::scalar_payout(cn, f, false))
+                .ok_or(ErrorCode::MathOverflow)?
         } else if market.state == STATE_RESOLVED {
-            // Binary: the winning-side reserve redeems 1:1; the losing-side pool
-            // tokens are worthless.
+            // Binary: the winning-side slice redeems 1:1; the losing-side tokens
+            // are worthless (but still burned to keep supply tracking the reserve).
             let side = Side::from_u8(market.outcome)?;
-            let (winning_reserve, winning_pool, winning_mint) = match side {
-                Side::Yes => (
-                    market.reserve_yes,
-                    ctx.accounts.pool_yes.to_account_info(),
-                    ctx.accounts.yes_mint.to_account_info(),
-                ),
-                Side::No => (
-                    market.reserve_no,
-                    ctx.accounts.pool_no.to_account_info(),
-                    ctx.accounts.no_mint.to_account_info(),
-                ),
-            };
-            require!(winning_reserve > 0, ErrorCode::NothingToClaim);
+            match side {
+                Side::Yes => cy,
+                Side::No => cn,
+            }
+        } else {
+            // Void: half of each slice.
+            (cy / 2) + (cn / 2)
+        };
+
+        // Burn this provider's slice of each pool reserve.
+        if cy > 0 {
             token::burn(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
                     Burn {
-                        mint: winning_mint,
-                        from: winning_pool,
+                        mint: ctx.accounts.yes_mint.to_account_info(),
+                        from: ctx.accounts.pool_yes.to_account_info(),
                         authority: market.to_account_info(),
                     },
                     signer,
                 ),
-                winning_reserve,
+                cy,
             )?;
-            market.reserve_yes = 0;
-            market.reserve_no = 0;
-            winning_reserve
-        } else {
-            // Void: half of each reserve.
-            let ry = market.reserve_yes;
-            let rn = market.reserve_no;
-            require!(ry > 0 || rn > 0, ErrorCode::NothingToClaim);
-            if ry > 0 {
-                token::burn(
-                    CpiContext::new_with_signer(
-                        ctx.accounts.token_program.to_account_info(),
-                        Burn {
-                            mint: ctx.accounts.yes_mint.to_account_info(),
-                            from: ctx.accounts.pool_yes.to_account_info(),
-                            authority: market.to_account_info(),
-                        },
-                        signer,
-                    ),
-                    ry,
-                )?;
-            }
-            if rn > 0 {
-                token::burn(
-                    CpiContext::new_with_signer(
-                        ctx.accounts.token_program.to_account_info(),
-                        Burn {
-                            mint: ctx.accounts.no_mint.to_account_info(),
-                            from: ctx.accounts.pool_no.to_account_info(),
-                            authority: market.to_account_info(),
-                        },
-                        signer,
-                    ),
-                    rn,
-                )?;
-            }
-            market.reserve_yes = 0;
-            market.reserve_no = 0;
-            (ry / 2) + (rn / 2)
-        };
+        }
+        if cn > 0 {
+            token::burn(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Burn {
+                        mint: ctx.accounts.no_mint.to_account_info(),
+                        from: ctx.accounts.pool_no.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                cn,
+            )?;
+        }
+
+        market.reserve_yes = market
+            .reserve_yes
+            .checked_sub(cy)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.reserve_no = market
+            .reserve_no
+            .checked_sub(cn)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.total_shares = total.checked_sub(shares).ok_or(ErrorCode::MathOverflow)?;
+        ctx.accounts.position.shares = 0;
 
         require!(
             payout <= market.collateral,
@@ -1248,6 +1466,7 @@ pub mod compute_markets {
         emit!(PoolClaimed {
             market: market.key(),
             lp: ctx.accounts.lp.key(),
+            provider: ctx.accounts.position.owner,
             payout
         });
         Ok(())
@@ -1395,8 +1614,12 @@ pub struct Market {
     pub pool_no: Pubkey,
     pub reserve_yes: u64,
     pub reserve_no: u64,
+    /// The initial liquidity provider (informational; the creator who seeded).
+    /// Per-provider balances live in [`LiquidityPosition`] PDAs.
     pub lp: Pubkey,
-    pub lp_shares: u64,
+    /// Total pool shares outstanding across all providers. A provider owns
+    /// `position.shares / total_shares` of the AMM reserves.
+    pub total_shares: u64,
     /// Collateral backing outstanding tokens (excludes accrued fees).
     pub collateral: u64,
     pub fee_accrued: u64,
@@ -1440,7 +1663,7 @@ impl Market {
         + 8  // reserve_yes
         + 8  // reserve_no
         + 32 // lp
-        + 8  // lp_shares
+        + 8  // total_shares
         + 8  // collateral
         + 8  // fee_accrued
         + 1  // state
@@ -1483,6 +1706,22 @@ impl Market {
             }
         }
     }
+}
+
+/// One liquidity provider's pool position in one market. PDA seeds
+/// `[LP_SEED, market, owner]`. `shares / market.total_shares` is the provider's
+/// fraction of the AMM reserves; created on `seed_liquidity` (the creator) or the
+/// provider's first `add_liquidity`, and drained to 0 by `claim_pool`.
+#[account]
+pub struct LiquidityPosition {
+    pub market: Pubkey,
+    pub owner: Pubkey,
+    pub shares: u64,
+    pub bump: u8,
+}
+
+impl LiquidityPosition {
+    pub const SPACE: usize = 8 + 32 + 32 + 8 + 1;
 }
 
 /// An on-chain numeric price feed. Designed to be populated by a Switchboard
@@ -1588,11 +1827,113 @@ pub struct SeedLiquidity<'info> {
     )]
     pub lp_collateral: Box<Account<'info, TokenAccount>>,
 
+    #[account(
+        init,
+        payer = lp,
+        space = LiquidityPosition::SPACE,
+        seeds = [LP_SEED, market.key().as_ref(), lp.key().as_ref()],
+        bump,
+    )]
+    pub position: Box<Account<'info, LiquidityPosition>>,
+
     #[account(mut)]
     pub lp: Signer<'info>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct AddLiquidity<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(mut, address = market.yes_mint)]
+    pub yes_mint: Box<Account<'info, Mint>>,
+    #[account(mut, address = market.no_mint)]
+    pub no_mint: Box<Account<'info, Mint>>,
+    #[account(mut, address = market.vault)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = market.pool_yes)]
+    pub pool_yes: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = market.pool_no)]
+    pub pool_no: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = lp_collateral.mint == market.collateral_mint @ ErrorCode::WrongMint,
+        constraint = lp_collateral.owner == lp.key() @ ErrorCode::WrongOwner,
+    )]
+    pub lp_collateral: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        constraint = lp_yes.mint == market.yes_mint @ ErrorCode::WrongMint,
+        constraint = lp_yes.owner == lp.key() @ ErrorCode::WrongOwner,
+    )]
+    pub lp_yes: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        constraint = lp_no.mint == market.no_mint @ ErrorCode::WrongMint,
+        constraint = lp_no.owner == lp.key() @ ErrorCode::WrongOwner,
+    )]
+    pub lp_no: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init_if_needed,
+        payer = lp,
+        space = LiquidityPosition::SPACE,
+        seeds = [LP_SEED, market.key().as_ref(), lp.key().as_ref()],
+        bump,
+    )]
+    pub position: Box<Account<'info, LiquidityPosition>>,
+
+    #[account(mut)]
+    pub lp: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct RemoveLiquidity<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(mut, address = market.pool_yes)]
+    pub pool_yes: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = market.pool_no)]
+    pub pool_no: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = lp_yes.mint == market.yes_mint @ ErrorCode::WrongMint,
+        constraint = lp_yes.owner == lp.key() @ ErrorCode::WrongOwner,
+    )]
+    pub lp_yes: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        constraint = lp_no.mint == market.no_mint @ ErrorCode::WrongMint,
+        constraint = lp_no.owner == lp.key() @ ErrorCode::WrongOwner,
+    )]
+    pub lp_no: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [LP_SEED, market.key().as_ref(), lp.key().as_ref()],
+        bump = position.bump,
+        has_one = market @ ErrorCode::Unauthorized,
+        has_one = owner @ ErrorCode::Unauthorized,
+    )]
+    pub position: Box<Account<'info, LiquidityPosition>>,
+    /// CHECK: bound to `position.owner` via `has_one`; must equal the signer `lp`.
+    #[account(address = lp.key() @ ErrorCode::Unauthorized)]
+    pub owner: UncheckedAccount<'info>,
+
+    pub lp: Signer<'info>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -1725,6 +2066,14 @@ pub struct ClaimPool<'info> {
         constraint = lp_collateral.owner == lp.key() @ ErrorCode::WrongOwner,
     )]
     pub lp_collateral: Box<Account<'info, TokenAccount>>,
+    /// The caller's own position (seeds bind it to `market` + `lp`), so each LP
+    /// claims exactly their pro-rata slice.
+    #[account(
+        mut,
+        seeds = [LP_SEED, market.key().as_ref(), lp.key().as_ref()],
+        bump = position.bump,
+    )]
+    pub position: Box<Account<'info, LiquidityPosition>>,
     pub lp: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
@@ -1839,9 +2188,29 @@ pub struct Redeemed {
 }
 
 #[event]
+pub struct LiquidityAdded {
+    pub market: Pubkey,
+    pub provider: Pubkey,
+    pub amount: u64,
+    pub shares_minted: u64,
+}
+
+#[event]
+pub struct LiquidityRemoved {
+    pub market: Pubkey,
+    pub provider: Pubkey,
+    pub shares: u64,
+    pub yes_out: u64,
+    pub no_out: u64,
+}
+
+#[event]
 pub struct PoolClaimed {
     pub market: Pubkey,
+    /// The signer who claimed (kept for compatibility).
     pub lp: Pubkey,
+    /// The position owner whose shares were claimed (== `lp`).
+    pub provider: Pubkey,
     pub payout: u64,
 }
 
@@ -1895,6 +2264,8 @@ pub enum ErrorCode {
     NoLiquidity,
     #[msg("Amount must be greater than zero")]
     ZeroAmount,
+    #[msg("Insufficient pool shares for this operation")]
+    InsufficientShares,
     #[msg("Invalid outcome (must be 0=YES or 1=NO)")]
     InvalidOutcome,
     #[msg("Unauthorized")]

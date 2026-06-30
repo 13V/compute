@@ -79,6 +79,18 @@ export function poolNoPda(market: PublicKey, programId: PublicKey = PROGRAM_ID) 
   return PublicKey.findProgramAddressSync([enc("pool_no"), market.toBuffer()], programId);
 }
 
+/** Per-provider liquidity-position PDA: seeds `["lp", market, owner]`. */
+export function liquidityPositionPda(
+  market: PublicKey,
+  owner: PublicKey,
+  programId: PublicKey = PROGRAM_ID
+) {
+  return PublicKey.findProgramAddressSync(
+    [enc("lp"), market.toBuffer(), owner.toBuffer()],
+    programId
+  );
+}
+
 /** Bundle of every PDA tied to a market id. */
 export function deriveMarketAccounts(
   marketId: BN | number,
