@@ -876,6 +876,8 @@
         "Initialize the global config (one per deployment).",
         "",
         "* `fee_bps` — taker fee on buy/sell (e.g. 100 = 1%), capped at `MAX_FEE_BPS`.",
+        "* `lp_fee_bps` — fraction OF THE TAKER FEE routed to LPs, in basis points",
+        "(0..=10_000; 10_000 = the entire fee to LPs).",
         "* `dispute_period` — seconds between a proposed outcome and payout unlock.",
         "* `guardian` — key allowed to pause and to veto a proposed outcome."
       ],
@@ -925,6 +927,10 @@
       "args": [
         {
           "name": "fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "lp_fee_bps",
           "type": "u16"
         },
         {
@@ -1910,6 +1916,53 @@
       ]
     },
     {
+      "name": "set_lp_fee_bps",
+      "docs": [
+        "Update the LP fee share (admin only), re-validated `<= 10_000` bps."
+      ],
+      "discriminator": [
+        255,
+        79,
+        85,
+        199,
+        175,
+        171,
+        86,
+        4
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "value",
+          "type": "u16"
+        }
+      ]
+    },
+    {
       "name": "set_paused",
       "docs": [
         "Pause or unpause all trading. Callable by the admin or the guardian."
@@ -2452,6 +2505,14 @@
           },
           {
             "name": "fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "lp_fee_bps",
+            "docs": [
+              "Fraction OF THE TAKER FEE routed to LPs, in basis points (0..=10_000).",
+              "The remainder of each fee accrues to the protocol (`fee_accrued`)."
+            ],
             "type": "u16"
           },
           {

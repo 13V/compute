@@ -119,15 +119,22 @@ pub mod compute_markets {
     /// Initialize the global config (one per deployment).
     ///
     /// * `fee_bps` — taker fee on buy/sell (e.g. 100 = 1%), capped at `MAX_FEE_BPS`.
+    /// * `lp_fee_bps` — fraction OF THE TAKER FEE routed to LPs, in basis points
+    ///   (0..=10_000; 10_000 = the entire fee to LPs).
     /// * `dispute_period` — seconds between a proposed outcome and payout unlock.
     /// * `guardian` — key allowed to pause and to veto a proposed outcome.
     pub fn initialize(
         ctx: Context<Initialize>,
         fee_bps: u16,
+        lp_fee_bps: u16,
         dispute_period: i64,
         guardian: Pubkey,
     ) -> Result<()> {
         require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
+        require!(
+            lp_fee_bps <= math::BPS_DENOMINATOR as u16,
+            ErrorCode::InvalidParameter
+        );
         require!(
             (0..=MAX_DISPUTE_PERIOD).contains(&dispute_period),
             ErrorCode::InvalidParameter
@@ -138,6 +145,7 @@ pub mod compute_markets {
         config.guardian = guardian;
         config.collateral_mint = ctx.accounts.collateral_mint.key();
         config.fee_bps = fee_bps;
+        config.lp_fee_bps = lp_fee_bps;
         config.dispute_period = dispute_period;
         config.market_count = 0;
         config.paused = false;
@@ -696,10 +704,64 @@ pub mod compute_markets {
             .collateral
             .checked_add(a)
             .ok_or(ErrorCode::MathOverflow)?;
+
+        // Split the fee: a configurable cut is reinvested as pool liquidity for
+        // LPs, the rest accrues to the protocol. The LP cut is floored so the
+        // protocol is never shorted.
+        let lp_cut =
+            math::lp_fee_cut(fee, ctx.accounts.config.lp_fee_bps).ok_or(ErrorCode::MathOverflow)?;
+        let protocol_cut = fee.checked_sub(lp_cut).ok_or(ErrorCode::MathOverflow)?;
         market.fee_accrued = market
             .fee_accrued
-            .checked_add(fee)
+            .checked_add(protocol_cut)
             .ok_or(ErrorCode::MathOverflow)?;
+
+        if lp_cut > 0 {
+            // Reinvest the LP cut as a full set minted into the pool reserves,
+            // which lifts every LP's pro-rata claim with no per-LP accounting.
+            // DELIBERATE side effect: minting an equal full set into
+            // possibly-unequal reserves nudges the marginal price slightly toward
+            // 0.5. This is intended (fee reinvestment) and tiny — `lp_cut` is at
+            // most `fee_bps * lp_fee_bps` of a single trade. Conservation is
+            // preserved: `collateral += lp_cut` and the vault already holds the
+            // full `collateral_in`, so `vault == collateral + fee_accrued` holds.
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint: ctx.accounts.yes_mint.to_account_info(),
+                        to: ctx.accounts.pool_yes.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                lp_cut,
+            )?;
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint: ctx.accounts.no_mint.to_account_info(),
+                        to: ctx.accounts.pool_no.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                lp_cut,
+            )?;
+            market.reserve_yes = market
+                .reserve_yes
+                .checked_add(lp_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
+            market.reserve_no = market
+                .reserve_no
+                .checked_add(lp_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
+            market.collateral = market
+                .collateral
+                .checked_add(lp_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
 
         emit!(TradeExecuted {
             market: market.key(),
@@ -826,10 +888,63 @@ pub mod compute_markets {
             .collateral
             .checked_sub(collateral_out)
             .ok_or(ErrorCode::MathOverflow)?;
+
+        // Split the fee symmetrically with `buy`: a configurable cut is reinvested
+        // as pool liquidity for LPs (floored so the protocol is never shorted),
+        // the rest accrues to the protocol.
+        let lp_cut =
+            math::lp_fee_cut(fee, ctx.accounts.config.lp_fee_bps).ok_or(ErrorCode::MathOverflow)?;
+        let protocol_cut = fee.checked_sub(lp_cut).ok_or(ErrorCode::MathOverflow)?;
         market.fee_accrued = market
             .fee_accrued
-            .checked_add(fee)
+            .checked_add(protocol_cut)
             .ok_or(ErrorCode::MathOverflow)?;
+
+        if lp_cut > 0 {
+            // Reinvest the LP cut as a full set minted into the pool reserves.
+            // DELIBERATE side effect: minting an equal full set into
+            // possibly-unequal reserves nudges the marginal price slightly toward
+            // 0.5. This is intended (fee reinvestment) and tiny. Net collateral
+            // change for the sell is `-collateral_out + lp_cut`; the vault paid out
+            // `collateral_out - fee`, so `vault == collateral + fee_accrued` holds
+            // (the `fee = lp_cut + protocol_cut` split balances exactly).
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint: ctx.accounts.yes_mint.to_account_info(),
+                        to: ctx.accounts.pool_yes.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                lp_cut,
+            )?;
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint: ctx.accounts.no_mint.to_account_info(),
+                        to: ctx.accounts.pool_no.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                lp_cut,
+            )?;
+            market.reserve_yes = market
+                .reserve_yes
+                .checked_add(lp_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
+            market.reserve_no = market
+                .reserve_no
+                .checked_add(lp_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
+            market.collateral = market
+                .collateral
+                .checked_add(lp_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
 
         emit!(TradeExecuted {
             market: market.key(),
@@ -1529,6 +1644,20 @@ pub mod compute_markets {
         Ok(())
     }
 
+    /// Update the LP fee share (admin only), re-validated `<= 10_000` bps.
+    pub fn set_lp_fee_bps(ctx: Context<AdminOnly>, value: u16) -> Result<()> {
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.config.admin,
+            ErrorCode::Unauthorized
+        );
+        require!(
+            value <= math::BPS_DENOMINATOR as u16,
+            ErrorCode::InvalidParameter
+        );
+        ctx.accounts.config.lp_fee_bps = value;
+        Ok(())
+    }
+
     /// Update the guardian (admin only).
     pub fn set_guardian(ctx: Context<AdminOnly>, guardian: Pubkey) -> Result<()> {
         require!(
@@ -1571,6 +1700,9 @@ pub struct Config {
     pub guardian: Pubkey,
     pub collateral_mint: Pubkey,
     pub fee_bps: u16,
+    /// Fraction OF THE TAKER FEE routed to LPs, in basis points (0..=10_000).
+    /// The remainder of each fee accrues to the protocol (`fee_accrued`).
+    pub lp_fee_bps: u16,
     pub dispute_period: i64,
     pub market_count: u64,
     pub paused: bool,
@@ -1578,7 +1710,9 @@ pub struct Config {
 }
 
 impl Config {
-    pub const SPACE: usize = 8 + 32 + 32 + 32 + 32 + 2 + 8 + 8 + 1 + 1;
+    // 8 disc + 4*32 keys + 2 fee_bps + 2 lp_fee_bps + 8 dispute_period
+    //   + 8 market_count + 1 paused + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 32 + 32 + 32 + 2 + 2 + 8 + 8 + 1 + 1;
 }
 
 #[account]

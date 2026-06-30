@@ -932,4 +932,147 @@ describe("compute-markets", () => {
       assert.match(msg, /ZeroAmount/);
     });
   });
+
+  describe("fee-to-LP routing", () => {
+    const LP_FEE_BPS = 5000; // 50% of each taker fee reinvested into the pool
+
+    /** TS mirror of `lp_fee_cut`: floor(fee * lpFeeBps / 10000). */
+    const lpFeeCut = (fee: BN, lpFeeBps: number) => fee.muln(lpFeeBps).divn(10_000);
+
+    before(async () => {
+      // `initialize` ran once globally with lp_fee_bps = 0; drive it for this
+      // suite. Restored to 0 in `after` so the other suites are unaffected.
+      await send([await client.setLpFeeBpsIx(admin.publicKey, LP_FEE_BPS)], admin);
+      assert.strictEqual((await client.fetchConfig()).lpFeeBps, LP_FEE_BPS);
+    });
+
+    after(async () => {
+      await send([await client.setLpFeeBpsIx(admin.publicKey, 0)], admin);
+      assert.strictEqual((await client.fetchConfig()).lpFeeBps, 0);
+    });
+
+    it("buy: protocol gets its cut, both reserves grow by lp_cut, conserves", async () => {
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      const before = await client.fetchMarketById(marketId);
+
+      const collateralIn = USDC(100);
+      const fee = feeAmount(collateralIn, FEE_BPS);
+      const lpCut = lpFeeCut(fee, LP_FEE_BPS);
+      const protocolCut = fee.sub(lpCut);
+      const a = collateralIn.sub(fee);
+      // The trade quotes on `a`; the lp_cut full set is minted AFTER the swap, so
+      // the new reserves = post-swap reserves + lp_cut on each side.
+      const q = quoteBuy(before.reserveYes, before.reserveNo, a);
+
+      await send(
+        await client.buyIxs(user1.publicKey, marketId, OUTCOME_YES, collateralIn, q.tokensOut, usdcMint),
+        user1
+      );
+
+      const after = await client.fetchMarketById(marketId);
+      assert.strictEqual(
+        after.feeAccrued.sub(before.feeAccrued).toString(),
+        protocolCut.toString(),
+        "fee_accrued increased by the protocol cut only"
+      );
+      assert.strictEqual(
+        after.reserveYes.sub(q.newReserveBought).toString(),
+        lpCut.toString(),
+        "YES reserve grew by lp_cut beyond the swap result"
+      );
+      assert.strictEqual(
+        after.reserveNo.sub(q.newReserveOther).toString(),
+        lpCut.toString(),
+        "NO reserve grew by lp_cut beyond the swap result"
+      );
+      assert.isTrue(lpCut.gtn(0), "sanity: lp_cut is non-zero for this trade");
+      await assertConservation(marketId, "buy-lp-fee");
+    });
+
+    it("sell: both reserves grow by lp_cut and conserves", async () => {
+      const marketId = await createSeededMarket({ seed: USDC(1000), resolutionOffset: 60, closeOffset: 60 });
+      // Give user1 a YES position to sell back.
+      await buy(user1, marketId, OUTCOME_YES, USDC(300));
+
+      const before = await client.fetchMarketById(marketId);
+      const out = USDC(50);
+      const fee = feeAmount(out, FEE_BPS);
+      const lpCut = lpFeeCut(fee, LP_FEE_BPS);
+      const q = quoteSell(before.reserveYes, before.reserveNo, out)!;
+
+      await send([await client.sellIx(user1.publicKey, marketId, OUTCOME_YES, out, q.tokensIn, usdcMint)], user1);
+
+      const after = await client.fetchMarketById(marketId);
+      // Post-swap reserves are (newReserveSold, newReserveOther); the lp_cut full
+      // set is then minted into BOTH, so each grows by exactly lp_cut.
+      assert.strictEqual(
+        after.reserveYes.sub(q.newReserveSold).toString(),
+        lpCut.toString(),
+        "YES (sold) reserve grew by lp_cut beyond the swap result"
+      );
+      assert.strictEqual(
+        after.reserveNo.sub(q.newReserveOther).toString(),
+        lpCut.toString(),
+        "NO (other) reserve grew by lp_cut beyond the swap result"
+      );
+      assert.isTrue(lpCut.gtn(0), "sanity: lp_cut is non-zero for this trade");
+      await assertConservation(marketId, "sell-lp-fee");
+    });
+
+    it("LPs actually earn: the sole LP claims back MORE than they seeded", async () => {
+      // The creator (admin) is the sole LP. After a batch of taker trades at
+      // lp_fee_bps > 0, their pro-rata claim must exceed the seed principal.
+      const seed = USDC(1000);
+      // Short window: the churn below finishes well within `closeOffset`, and the
+      // resolution wait then lands inside `waitChainTime`'s poll budget.
+      const marketId = await createSeededMarket({ seed, resolutionOffset: 25, closeOffset: 25 });
+
+      // Churn several buys/sells by other users so fees (and the LP cut) accrue.
+      for (let i = 0; i < 3; i++) {
+        await buy(user1, marketId, OUTCOME_YES, USDC(120));
+        await buy(user2, marketId, OUTCOME_NO, USDC(120));
+        // Sell a little back from each (they hold the side they bought).
+        const my = await client.fetchMarketById(marketId);
+        const sYes = quoteSell(my.reserveYes, my.reserveNo, USDC(30));
+        if (sYes) await send([await client.sellIx(user1.publicKey, marketId, OUTCOME_YES, USDC(30), sYes.tokensIn, usdcMint)], user1);
+        const mn = await client.fetchMarketById(marketId);
+        const sNo = quoteSell(mn.reserveNo, mn.reserveYes, USDC(30));
+        if (sNo) await send([await client.sellIx(user2.publicKey, marketId, OUTCOME_NO, USDC(30), sNo.tokensIn, usdcMint)], user2);
+        await assertConservation(marketId, `churn-${i}`);
+      }
+
+      // Resolve so the LP can claim their reserves as collateral. Use a void so
+      // BOTH sides of the slice pay out (half each) — this realizes the fee
+      // reinvestment regardless of which side won.
+      const m = await client.fetchMarketById(marketId);
+      await waitChainTime(m.resolutionTime.toNumber() + 1);
+      await send([await client.proposeOutcomeIx(admin.publicKey, marketId, OUTCOME_YES)], admin);
+      await send([await client.disputeVoidIx(guardian.publicKey, marketId)], guardian);
+      assert.strictEqual((await client.fetchMarketById(marketId)).state, STATE_VOID);
+
+      const adminUsdc = getAssociatedTokenAddressSync(usdcMint, admin.publicKey);
+      const usdcBefore = await tokenBalance(adminUsdc);
+      await send([await client.claimPoolIx(admin.publicKey, marketId, usdcMint)], admin);
+      const payout = (await tokenBalance(adminUsdc)).sub(usdcBefore);
+
+      assert.isTrue(
+        payout.gt(seed),
+        `LP payout ${payout} should exceed seed principal ${seed} (earned the reinvested fee cuts)`
+      );
+      await assertConservation(marketId, "lp-earns-claim");
+    });
+
+    it("rejects setLpFeeBps > 10000 and a non-admin caller", async () => {
+      assert.match(
+        await sendExpectFail([await client.setLpFeeBpsIx(admin.publicKey, 10_001)], admin),
+        /InvalidParameter/
+      );
+      assert.match(
+        await sendExpectFail([await client.setLpFeeBpsIx(user1.publicKey, 100)], user1),
+        /Unauthorized/
+      );
+      // The valid value set in `before` is unchanged after the failed calls.
+      assert.strictEqual((await client.fetchConfig()).lpFeeBps, LP_FEE_BPS);
+    });
+  });
 });

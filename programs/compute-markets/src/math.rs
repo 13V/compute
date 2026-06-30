@@ -181,6 +181,21 @@ pub fn fee_amount(amount: u64, fee_bps: u16) -> Option<u64> {
     u64::try_from(f).ok()
 }
 
+/// The slice of a taker `fee` routed to liquidity providers, in basis points of
+/// the fee: `floor(fee * lp_fee_bps / 10_000)` (u128 intermediate).
+///
+/// Rounded **down** so the LP cut never exceeds its fair share and the protocol
+/// (which keeps `fee - lp_cut`) is never shorted. `lp_fee_bps == 0` yields 0 and
+/// `lp_fee_bps == 10_000` yields the whole `fee`. Callers validate
+/// `lp_fee_bps <= 10_000` at config time; a larger value here is still safe (the
+/// result is just capped by `fee` only when `lp_fee_bps <= 10_000`).
+pub fn lp_fee_cut(fee: u64, lp_fee_bps: u16) -> Option<u64> {
+    let cut = (fee as u128)
+        .checked_mul(lp_fee_bps as u128)?
+        .checked_div(BPS_DENOMINATOR as u128)?;
+    u64::try_from(cut).ok()
+}
+
 /// Fixed-point scale for scalar-market settlement fractions: a fraction `f` in
 /// `[0, 1]` is represented as the integer `f * PRICE_SCALE`, so `PRICE_SCALE`
 /// means 1.0 and `PRICE_SCALE / 2` means 0.5. (Matches the 1e6 price scale used
@@ -543,6 +558,28 @@ mod tests {
         assert_eq!(fee_amount(1_000_000, 0).unwrap(), 0);
         assert_eq!(fee_amount(0, 100).unwrap(), 0);
         assert_eq!(fee_amount(999, 100).unwrap(), 9); // rounds down
+    }
+
+    #[test]
+    fn lp_fee_cut_math() {
+        // 0 bps routes nothing to LPs.
+        assert_eq!(lp_fee_cut(10_000, 0).unwrap(), 0);
+        // 10_000 bps routes the entire fee to LPs.
+        assert_eq!(lp_fee_cut(10_000, 10_000).unwrap(), 10_000);
+        assert_eq!(lp_fee_cut(1, 10_000).unwrap(), 1);
+        // 5_000 bps (half) floors down so the protocol is never shorted.
+        assert_eq!(lp_fee_cut(10_000, 5_000).unwrap(), 5_000);
+        assert_eq!(lp_fee_cut(7, 5_000).unwrap(), 3); // floor(3.5) == 3
+        assert_eq!(lp_fee_cut(0, 5_000).unwrap(), 0);
+        // Overflow-safe at the u64 envelope (u128 intermediate).
+        assert_eq!(lp_fee_cut(u64::MAX, 0).unwrap(), 0);
+        assert_eq!(lp_fee_cut(u64::MAX, 10_000).unwrap(), u64::MAX);
+        // The protocol cut (fee - lp_cut) is always non-negative for valid bps.
+        let fee = 1_000_000u64;
+        for bps in [0u16, 1, 2_500, 5_000, 9_999, 10_000] {
+            let cut = lp_fee_cut(fee, bps).unwrap();
+            assert!(cut <= fee, "lp cut {cut} exceeds fee {fee} at {bps} bps");
+        }
     }
 
     #[test]

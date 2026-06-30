@@ -101,10 +101,17 @@ export class ComputeClient {
 
   // ----- setup -----
 
-  async initializeIx(admin: PublicKey, collateralMint: PublicKey, feeBps: number, disputePeriod: BN, guardian: PublicKey) {
+  async initializeIx(
+    admin: PublicKey,
+    collateralMint: PublicKey,
+    feeBps: number,
+    disputePeriod: BN,
+    guardian: PublicKey,
+    lpFeeBps?: number
+  ) {
     const [config] = configPda(this.programId);
     return this.program.methods
-      .initialize(feeBps, disputePeriod, guardian)
+      .initialize(feeBps, lpFeeBps ?? 0, disputePeriod, guardian)
       .accountsPartial({ config, collateralMint, admin, systemProgram: SystemProgram.programId })
       .instruction();
   }
@@ -488,6 +495,14 @@ export class ComputeClient {
   async setFeeBpsIx(admin: PublicKey, feeBps: number) {
     return this.program.methods
       .setFeeBps(feeBps)
+      .accountsPartial({ config: configPda(this.programId)[0], admin })
+      .instruction();
+  }
+
+  /** Set the fraction of the taker fee routed to LPs (admin only, 0..=10000 bps). */
+  async setLpFeeBpsIx(admin: PublicKey, value: number) {
+    return this.program.methods
+      .setLpFeeBps(value)
       .accountsPartial({ config: configPda(this.programId)[0], admin })
       .instruction();
   }

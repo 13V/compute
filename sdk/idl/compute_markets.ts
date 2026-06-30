@@ -883,6 +883,8 @@ export type ComputeMarkets = {
         "Initialize the global config (one per deployment).",
         "",
         "* `fee_bps` — taker fee on buy/sell (e.g. 100 = 1%), capped at `MAX_FEE_BPS`.",
+        "* `lp_fee_bps` — fraction OF THE TAKER FEE routed to LPs, in basis points",
+        "(0..=10_000; 10_000 = the entire fee to LPs).",
         "* `dispute_period` — seconds between a proposed outcome and payout unlock.",
         "* `guardian` — key allowed to pause and to veto a proposed outcome."
       ],
@@ -932,6 +934,10 @@ export type ComputeMarkets = {
       "args": [
         {
           "name": "feeBps",
+          "type": "u16"
+        },
+        {
+          "name": "lpFeeBps",
           "type": "u16"
         },
         {
@@ -1917,6 +1923,53 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "setLpFeeBps",
+      "docs": [
+        "Update the LP fee share (admin only), re-validated `<= 10_000` bps."
+      ],
+      "discriminator": [
+        255,
+        79,
+        85,
+        199,
+        175,
+        171,
+        86,
+        4
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "value",
+          "type": "u16"
+        }
+      ]
+    },
+    {
       "name": "setPaused",
       "docs": [
         "Pause or unpause all trading. Callable by the admin or the guardian."
@@ -2459,6 +2512,14 @@ export type ComputeMarkets = {
           },
           {
             "name": "feeBps",
+            "type": "u16"
+          },
+          {
+            "name": "lpFeeBps",
+            "docs": [
+              "Fraction OF THE TAKER FEE routed to LPs, in basis points (0..=10_000).",
+              "The remainder of each fee accrues to the protocol (`fee_accrued`)."
+            ],
             "type": "u16"
           },
           {
