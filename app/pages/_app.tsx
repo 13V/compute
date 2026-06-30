@@ -2,6 +2,7 @@ import type { AppProps } from "next/app";
 import dynamic from "next/dynamic";
 import Head from "next/head";
 import { Inter } from "next/font/google";
+import { TxProvider } from "../components/tx";
 import "../styles/globals.css";
 
 // Self-host Inter at build time (no render-blocking external request).
@@ -29,7 +30,9 @@ export default function App({ Component, pageProps }: AppProps) {
       </Head>
       <div className={inter.className} style={{ minHeight: "100vh" }}>
         <WalletProviders>
-          <Component {...pageProps} />
+          <TxProvider>
+            <Component {...pageProps} />
+          </TxProvider>
         </WalletProviders>
       </div>
     </>
