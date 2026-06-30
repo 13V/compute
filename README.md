@@ -40,6 +40,11 @@ continuous, always-on pricing rather than waiting for a counterparty.
   value to a fraction `f` and pays LONG `f` / SHORT `1 − f` (`redeem_scalar`).
 - **Resolve** is **two steps**: the market's `resolver` *proposes* an outcome (`propose_outcome`
   binary / `propose_scalar` scalar), then — after a dispute window — anyone *finalizes* it.
+  Markets may instead resolve from an **oracle feed** or via an **optimistic (bonded
+  assert/dispute)** resolver — see Settlement defenses below.
+- **Fees split to LPs.** A configurable fraction of every taker fee (`config.lp_fee_bps`) is
+  *reinvested as pool liquidity* — an equal full set minted into the reserves — so every LP's
+  pro-rata claim grows automatically; the protocol keeps the rest. Conservation is unchanged.
 - **Redeem** burns winning binary tokens 1:1 for collateral (losing side worthless), or scalar
   tokens at their settled fraction.
 
@@ -80,17 +85,26 @@ A manual resolver is a trusted component, so settlement is defended in depth:
   strike and proposes the outcome — flowing through the **same** dispute window + guardian veto,
   with a staleness guard. The feed is posted to by a Switchboard On-Demand Function (TEE-attested)
   or a committee multisig; the trusted key remains the default. See [`docs/ORACLE.md`](docs/ORACLE.md).
+- **Optimistic (bonded) resolver.** A binary market may set `resolver_kind = 2` (`OPTIMISTIC`):
+  anyone `assert_outcome`s by posting a bond, anyone may `dispute_assertion` with an equal bond,
+  undisputed assertions `finalize_assertion` (asserter reclaims the bond), and the **guardian
+  settles disputes** with `resolve_dispute` (the `2·bond` goes to the correct side). Bonds live
+  in a **separate** bond vault, isolated from the collateral invariant. See [`docs/ORACLE.md`](docs/ORACLE.md).
 - **Forward-compat oracles.** `resolver_kind` + 64 reserved bytes leave room for the remaining
-  resolvers (native Switchboard-account parsing / Pyth / optimistic) without a layout-breaking
-  change — those are not yet wired.
+  resolvers without a layout-breaking change. **Native Switchboard-account parsing and Pyth are
+  deferred** — adding their SDKs pulls a conflicting `solana-program` 2.3.x against our
+  Agave-4.0/Anchor-0.31 4.0.x build (and Switchboard is redundant with the feed-bridge, Pyth has
+  no compute feeds); see [`docs/ORACLE.md`](docs/ORACLE.md) §11.
 
-### Instructions (25)
+### Instructions (31)
 
 `initialize` · `create_market` · `seed_liquidity` · `add_liquidity` · `remove_liquidity` ·
 `buy` · `sell` · `propose_outcome` · `propose_scalar` · `propose_from_oracle` ·
-`finalize_outcome` · `dispute_void` · `void_stale` · `redeem` · `redeem_scalar` ·
+`finalize_outcome` · `assert_outcome` · `dispute_assertion` · `finalize_assertion` ·
+`resolve_dispute` · `dispute_void` · `void_stale` · `redeem` · `redeem_scalar` ·
 `redeem_void` · `claim_pool` · `collect_fees` · `init_price_feed` · `publish_price` ·
-`set_paused` · `set_fee_bps` · `set_guardian` · `set_admin` · `accept_admin`.
+`set_paused` · `set_fee_bps` · `set_lp_fee_bps` · `set_bond_amount` · `set_guardian` ·
+`set_admin` · `accept_admin`.
 
 Full surface (every instruction, account, error, event, PDA seed) is in
 [`docs/REFERENCE.md`](docs/REFERENCE.md).
@@ -169,14 +183,18 @@ upgrade-authority custody via a Squads multisig) is in
 
 This MVP now supports **binary and scalar/range** markets, FPMM trading, **multi-LP
 liquidity** (per-provider share ledger, `add_liquidity` / `remove_liquidity`, per-LP
-`claim_pool`), and a **trusted resolver key by default** (defended in depth). Settlement also
-offers an **oracle feed-bridge adapter**: markets can resolve from an on-chain `PriceFeed`
-posted to by a Switchboard On-Demand Function or a committee multisig, still passing through the
-dispute window + guardian veto (see [`docs/ORACLE.md`](docs/ORACLE.md)) — but the trusted key
-remains the default and the residual trust shifts to the feed authority rather than disappearing.
-Known non-goals today: native Switchboard-account parsing / Pyth / a Solana-native optimistic
-oracle remain future, taker fees are **not yet routed to LPs** (fees stay a separate admin
-bucket), and the guardian can only *void* a bad proposal (50/50 refund), not correct it. The
-load-bearing next steps are **hardening the oracle layer** and **fee-to-LP routing** — see
+`claim_pool`) with **taker-fee-to-LP routing** (`lp_fee_bps` reinvests a fee fraction as pool
+liquidity, conservation unchanged), and a **trusted resolver key by default** (defended in
+depth). Settlement also offers an **oracle feed-bridge adapter** (markets resolve from an
+on-chain `PriceFeed` posted to by a Switchboard On-Demand Function or a committee multisig) and
+an **optimistic (bonded assert/dispute) resolver** settled by the guardian — both passing through
+the dispute window (see [`docs/ORACLE.md`](docs/ORACLE.md)); the trusted key remains the default
+and the residual trust shifts to the feed authority / disputers + guardian rather than
+disappearing. **Deferred (decision recorded):** native Switchboard-account parsing and Pyth —
+their SDKs pull a conflicting `solana-program` 2.3.x against our Agave-4.0/Anchor-0.31 build,
+Switchboard is redundant with the feed-bridge, and Pyth has no compute feeds
+([`docs/ORACLE.md`](docs/ORACLE.md) §11). The guardian can only *void* a bad proposal on
+trusted-key/oracle markets (it *can* pick the correct outcome of a disputed optimistic
+assertion). The load-bearing next step remains **hardening the oracle layer** — see
 [`docs/RESEARCH.md`](docs/RESEARCH.md) and [`docs/WORLDCLASS.md`](docs/WORLDCLASS.md).
 **Not audited; do not use with real funds.**

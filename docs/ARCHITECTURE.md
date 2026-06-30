@@ -19,7 +19,7 @@ known limitations see [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 | Component | Path | Role |
 |---|---|---|
-| **Anchor program** | `programs/compute-markets/` | The on-chain protocol: 25 instructions, the `Config`, `Market`, `LiquidityPosition`, and `PriceFeed` accounts, the FPMM trade math, the settlement state machine (trusted-key **and** oracle-feed resolution; binary **and** scalar markets), multi-LP liquidity, custody of collateral in PDA vaults. The load-bearing security surface. |
+| **Anchor program** | `programs/compute-markets/` | The on-chain protocol: 31 instructions, the `Config`, `Market`, `LiquidityPosition`, and `PriceFeed` accounts, the FPMM trade math, the settlement state machine (trusted-key, oracle-feed, **and optimistic** resolution; binary **and** scalar markets), multi-LP liquidity with fee reinvestment, custody of collateral in PDA vaults. The load-bearing security surface. |
 | **FPMM math** | `programs/compute-markets/src/math.rs` | Pure, dependency-free arithmetic for buy/sell quotes, fees, and marginal price. No Solana/Anchor types, so it is exhaustively unit- and property-tested on the host. All economically load-bearing rounding lives here. |
 | **TypeScript SDK** | `sdk/` | PDA derivation, off-chain AMM quote helpers, a typed Anchor client, and the vendored IDL (`sdk/idl/`). |
 | **Web app** | `app/` | Next.js frontend: wallet connect, trade/redeem flows. Ships its own vendored IDL copy (`app/lib/idl/`). |
@@ -104,6 +104,35 @@ Marginal price (probability) of an outcome is `other_reserve / (self_reserve +
 other_reserve)`, scaled by 1e6 (`marginal_price_micro`); buying a side raises its
 price.
 
+### Fee distribution (protocol vs LP)
+
+The taker fee on every `buy`/`sell` is split between the protocol and the LPs by
+`config.lp_fee_bps` — a fraction **of the fee** in basis points (`0..=10_000`),
+configured at `initialize` and updatable by `set_lp_fee_bps`:
+
+```text
+fee          = floor(gross · fee_bps / 10_000)          # the taker fee
+lp_cut       = floor(fee · lp_fee_bps / 10_000)         # math::lp_fee_cut (floored)
+protocol_cut = fee − lp_cut                             # accrues to fee_accrued
+```
+
+The `protocol_cut` accrues to `fee_accrued` (swept by `collect_fees`, as before).
+The `lp_cut` is **reinvested as pool liquidity**: the program mints a full
+`lp_cut` set (`lp_cut` YES **and** `lp_cut` NO) into the reserves and adds `lp_cut`
+to `collateral` (`reserve_yes += lp_cut`, `reserve_no += lp_cut`,
+`collateral += lp_cut`). Because the cut grows the reserves themselves, **every
+LP's pro-rata claim grows automatically** — there is no per-LP fee-debt
+accounting and no join-dilution to track. The split is floored so the protocol is
+never shorted (`lp_cut <= fee`).
+
+This leaves the **conservation invariant `vault == collateral + fee_accrued`
+unchanged**: the vault already holds the gross collateral, and the equal full-set
+mint only moves `lp_cut` from the would-be `fee_accrued` into `collateral`.
+Minting an *equal* set into possibly-unequal reserves has one documented, tiny
+side effect — it nudges the marginal price slightly **toward 0.5** (the cut is at
+most `fee_bps · lp_fee_bps` of a single trade). This is intended fee
+reinvestment, not a leak.
+
 ### 2.5 Market types (binary vs scalar)
 
 `market.market_kind` selects the payout shape; **trading is identical** for both.
@@ -175,8 +204,9 @@ integration test.
 Four account types, all Anchor-owned:
 
 - **`Config`** — one per deployment. Holds `admin`, `pending_admin`, `guardian`,
-  the `collateral_mint`, `fee_bps`, `dispute_period`, a monotonic `market_count`,
-  the global `paused` flag, and the PDA bump.
+  the `collateral_mint`, `fee_bps`, `lp_fee_bps` (the fraction of the taker fee
+  reinvested to LPs), `dispute_period`, a monotonic `market_count`, the global
+  `paused` flag, `bond_amount` (the optimistic-resolver bond), and the PDA bump.
 - **`Market`** — one per market. Holds identity (`market_id`, `creator`,
   `resolver`, `resolver_kind`), the **market-kind config** (`market_kind`,
   `lower_bound`, `upper_bound`, `proposed_value`, `settlement_fraction`, used for
@@ -186,8 +216,10 @@ Four account types, all Anchor-owned:
   `vault`, `pool_yes`, `pool_no`), the AMM state (`reserve_yes`, `reserve_no`,
   `lp`, `total_shares`), the accounting (`collateral`, `fee_accrued`), the
   lifecycle (`state`, `outcome`, `proposed_outcome`, `close_time`,
-  `resolution_time`, `resolved_at`), the display strings (`question`,
-  `resolution_source`), and **64 reserved bytes** of forward-compat padding.
+  `resolution_time`, `resolved_at`), the **optimistic-resolver bookkeeping**
+  (`asserter`, `disputer`, `bond`, `disputed`, used when `resolver_kind ==
+  OPTIMISTIC`), the display strings (`question`, `resolution_source`), and **64
+  reserved bytes** of forward-compat padding.
 - **`LiquidityPosition`** — one per (market, provider). A PDA
   (`["lp", market, owner]`) holding `market`, `owner`, `shares`, and a bump.
   `shares / market.total_shares` is the provider's fraction of the reserves.
@@ -231,11 +263,13 @@ u64**; `market` below means the Market account's own pubkey.
 | `pool_yes` | `["pool_yes", market]` | AMM reserve of YES tokens; authority = Market PDA. |
 | `pool_no` | `["pool_no", market]` | AMM reserve of NO tokens; authority = Market PDA. |
 | `LiquidityPosition` | `["lp", market, owner]` | One per provider; tracks `shares` of `market.total_shares`. Signer-bound to `owner`. |
+| `bond_vault` | `["bond", market]` | Optimistic-resolver bond escrow; token account, authority = Market PDA. **Separate** from `vault` — bonds never touch the collateral-conservation invariant. Created on first `assert_outcome`. |
 
 The `vault`/`yes_mint`/`no_mint` are created at `create_market`; the
 `pool_yes`/`pool_no` and the creator's `LiquidityPosition` are created at
 `seed_liquidity`; further provider positions are created on their first
-`add_liquidity` (Anchor `init-if-needed`).
+`add_liquidity` (Anchor `init-if-needed`); the `bond_vault` is created on the
+first `assert_outcome` of an optimistic market.
 
 ## 4. Resolution state machine
 
@@ -248,9 +282,12 @@ stateDiagram-v2
     OPEN --> OPEN: buy / sell (while now < close_time)
     OPEN --> RESOLVING: propose_outcome (resolver, TRUSTED_KEY)
     OPEN --> RESOLVING: propose_from_oracle (anyone, ORACLE_FEED)
+    OPEN --> RESOLVING: assert_outcome (anyone + bond, OPTIMISTIC)
     OPEN --> VOID: void_stale (anyone, now > resolution_time + 7d)
     RESOLVING --> RESOLVED: finalize_outcome (anyone, after dispute_period)
-    RESOLVING --> VOID: dispute_void (guardian, during dispute window)
+    RESOLVING --> RESOLVED: finalize_assertion (asserter, undisputed, after window)
+    RESOLVING --> RESOLVED: resolve_dispute (guardian, disputed)
+    RESOLVING --> VOID: dispute_void (guardian, during window; non-optimistic)
     RESOLVED --> [*]: redeem / claim_pool / collect_fees
     VOID --> [*]: redeem_void / claim_pool / collect_fees
 ```
@@ -266,15 +303,22 @@ Lifecycle in words:
    into the pools at 50/50, and opens trading.
 4. **`buy` / `sell`** run while `now < close_time` and not paused.
 5. **Step 1 of resolution → `RESOLVING`** at/after `resolution_time`, via one of
-   two paths depending on `resolver_kind` (both record `proposed_outcome` +
+   three paths depending on `resolver_kind` (all record `proposed_outcome` +
    `resolved_at`; **payouts stay locked**):
    - **`propose_outcome`** (`TRUSTED_KEY`) — the `resolver` key proposes a winning
      outcome.
    - **`propose_from_oracle`** (`ORACLE_FEED`, **permissionless**) — derives the
-     outcome from the bound `PriceFeed` (see the subsection below).
+     outcome from the bound `PriceFeed` (see the oracle subsection below).
+   - **`assert_outcome`** (`OPTIMISTIC`, **permissionless + bonded**) — anyone
+     posts `config.bond_amount` and asserts a binary outcome (see the optimistic
+     subsection below).
 6. **Dispute window** of `config.dispute_period` seconds:
-   - **`finalize_outcome`** (permissionless) after the window → `RESOLVED`.
+   - **`finalize_outcome`** (permissionless) after the window → `RESOLVED` (trusted
+     /oracle paths).
+   - **`finalize_assertion`** (asserter) / **`resolve_dispute`** (guardian) →
+     `RESOLVED` (optimistic path; see below).
    - **`dispute_void`** (guardian) during the window → `VOID` (reason `DISPUTE`).
+     Optimistic markets are excluded (they settle via `resolve_dispute`).
 7. **`void_stale`** (permissionless) — if the resolver never proposed and
    `now > resolution_time + VOID_GRACE_PERIOD` (7 days), anyone may move an
    `OPEN` market straight to `VOID` (reason `STALE`).
@@ -311,6 +355,36 @@ committee multisig), not a single resolver key. The program reads a first-party
 `PriceFeed`; it does not parse Switchboard's native account. Full design,
 manipulation analysis, and a worked example are in [`ORACLE.md`](ORACLE.md).
 
+### Optimistic-oracle resolver
+
+A `RESOLVER_OPTIMISTIC` market (`resolver_kind = 2`, **binary only**) replaces the
+single resolver/feed with a UMA-style **bonded assert/dispute** game that feeds the
+*same* `RESOLVING → RESOLVED` states:
+
+1. **`assert_outcome(outcome)`** (permissionless) — at/after `resolution_time`,
+   anyone posts `config.bond_amount` into the **separate bond vault** PDA
+   (`["bond", market]`, authority = Market PDA) and asserts a binary outcome.
+   `OPEN → RESOLVING`; records `asserter`, `proposed_outcome`, `bond`, and opens the
+   dispute window. Requires `bond_amount > 0` (`NoBondConfigured` otherwise).
+2. **Undisputed →** after the window, **`finalize_assertion`** (the asserter)
+   refunds the asserter's bond (PDA-signed from the bond vault) and resolves to the
+   asserted outcome → `RESOLVED`.
+3. **Disputed →** within the window, **`dispute_assertion`** (anyone but the
+   asserter — `SelfDispute` blocks self-dispute) posts an equal bond and flags the
+   assertion `disputed`; a disputed assertion can no longer self-finalize
+   (`DisputeUnresolved`). The **guardian** then calls **`resolve_dispute(correct_outcome)`**,
+   which awards the whole `2 · bond` escrow to whoever asserted the correct side
+   (asserter if `proposed_outcome == correct_outcome`, else disputer; the
+   `winner_collateral` owner/mint are checked against the ruling) and resolves to
+   `correct_outcome` → `RESOLVED`.
+
+The bonds live **only** in the bond vault, which **nets to zero on every path**
+(refund on undisputed; the full `2·bond` paid to the winner on disputed). The
+collateral `vault` and its conservation invariant (`vault == collateral +
+fee_accrued`) are **never touched** by the optimistic flow. `dispute_void` is
+disabled for optimistic markets, keeping the bonded-dispute and guardian-void flows
+from crossing. See [`ORACLE.md`](ORACLE.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md).
+
 ## 5. Event flow for indexers
 
 Every state-changing instruction emits an Anchor event (CPI log). An indexer
@@ -326,7 +400,10 @@ reconcile balances from these alone:
 | `TradeExecuted` | `buy` / `sell` | `market`, `user`, `is_buy`, `outcome`, `collateral` (gross), `tokens` |
 | `OutcomeProposed` | `propose_outcome` / `propose_from_oracle` | `market`, `resolver` (the feed pubkey on the oracle path), `outcome`, `proposed_at` |
 | `ScalarProposed` | `propose_scalar` | `market`, `resolver`, `value`, `proposed_at` |
-| `MarketResolved` | `finalize_outcome` | `market`, `outcome`, `settlement_fraction` (scalar `f`; `0` for binary), `resolved_at` (finalize time) |
+| `OutcomeAsserted` | `assert_outcome` | `market`, `asserter`, `outcome`, `bond`, `asserted_at` |
+| `AssertionDisputed` | `dispute_assertion` | `market`, `disputer` |
+| `DisputeResolved` | `resolve_dispute` | `market`, `outcome`, `winner` (the asserter or disputer awarded `2·bond`) |
+| `MarketResolved` | `finalize_outcome` / `finalize_assertion` | `market`, `outcome`, `settlement_fraction` (scalar `f`; `0` for binary), `resolved_at` (finalize time) |
 | `MarketVoided` | `dispute_void` / `void_stale` | `market`, `reason` (`0 = DISPUTE`, `1 = STALE`) |
 | `Redeemed` | `redeem` / `redeem_scalar` / `redeem_void` | `market`, `user`, `amount` (tokens burned), `payout` (collateral out) |
 | `PoolClaimed` | `claim_pool` | `market`, `lp` (caller), `provider` (position owner), `payout` |
@@ -344,6 +421,11 @@ Notes for indexers:
   `proposed_at + dispute_period`.
 - A market reaching `MarketVoided` after `OutcomeProposed` is a guardian veto;
   one reaching it from `OPEN` with `reason = STALE` is the liveness hatch.
+- On an optimistic market the dispute window opens at `OutcomeAsserted.asserted_at`;
+  an undisputed assertion ends at `MarketResolved` (via `finalize_assertion`), a
+  disputed one (`AssertionDisputed`) ends at `DisputeResolved` + `MarketResolved`
+  (via `resolve_dispute`). Bond movements happen in the **separate bond vault**, so
+  they do not appear in the collateral-conservation sum below.
 - To track the conservation invariant off-chain, sum `TradeExecuted` deltas plus
   `LiquiditySeeded`, `LiquidityAdded.amount`, `Redeemed.payout`,
   `PoolClaimed.payout`, and `FeesCollected.amount` against the vault balance.

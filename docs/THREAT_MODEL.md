@@ -28,6 +28,9 @@ multisig — see [`DEPLOYMENT.md`](DEPLOYMENT.md)).
 **CAN:**
 
 - Set the taker fee `set_fee_bps` (re-checked `<= MAX_FEE_BPS = 1000`).
+- Set the LP fee share `set_lp_fee_bps` (re-checked `<= 10_000` bps) — the fraction
+  of each taker fee reinvested to LPs (the rest accrues to the protocol).
+- Set the optimistic-resolver bond `set_bond_amount` (`0` disables `assert_outcome`).
 - Replace the guardian `set_guardian`.
 - Pause / unpause all trading `set_paused`.
 - Sweep accrued protocol fees `collect_fees` (the `fee_accrued` bucket only).
@@ -49,14 +52,20 @@ multisig — see [`DEPLOYMENT.md`](DEPLOYMENT.md)).
 
 - Pause / unpause all trading `set_paused`.
 - Veto a proposed outcome during the dispute window `dispute_void`, sending the
-  market to a 50/50 void refund.
+  market to a 50/50 void refund (trusted-key / oracle-feed markets).
+- On `RESOLVER_OPTIMISTIC` markets only, **settle a disputed assertion** via
+  `resolve_dispute(correct_outcome)` — here it *picks the correct outcome* and
+  awards the `2 · bond` escrow to the matching side (see the optimistic-resolver
+  role below). `dispute_void` is disabled on those markets.
 
 **CANNOT:**
 
-- Choose or change the winning outcome (only veto into a void).
-- Act after the dispute window closes, or before an outcome is proposed.
+- Choose or change the winning outcome on trusted-key / oracle-feed markets (only
+  veto into a void). The outcome-picking power exists **only** on optimistic markets
+  and only for a *disputed* assertion.
+- Act after the dispute window closes, or before an outcome is proposed/asserted.
 - Collect fees, change fees, or transfer admin.
-- Touch collateral directly.
+- Touch collateral directly (bond payouts move only the separate bond vault).
 
 ### Resolver (`Market.resolver`, per market — trusted-key markets)
 
@@ -104,6 +113,48 @@ settlement trust for those markets.
 - Override a guardian veto — a manipulated feed value yields a *vetoable* proposal,
   not a final one.
 
+### Optimistic resolver participants (asserter / disputer — `RESOLVER_OPTIMISTIC` markets)
+
+On `RESOLVER_OPTIMISTIC` markets (binary only) there is **no privileged resolver
+key**: the proposed outcome comes from a **bonded assertion** that anyone may make,
+and the guardian acts as the **dispute arbiter** (not just a veto). The trust here
+is **economic**, backed by `config.bond_amount`.
+
+**An asserter / disputer (anyone) CAN:**
+
+- `assert_outcome(outcome)` by posting `config.bond_amount` into the bond vault,
+  starting the dispute window (permissionless, at/after `resolution_time`).
+- `dispute_assertion()` an open assertion by posting an **equal** bond (anyone
+  except the asserter; self-dispute is blocked with `SelfDispute`).
+- `finalize_assertion()` an **undisputed** assertion after the window — reclaiming
+  their own bond and resolving the market to the asserted outcome.
+
+**They CANNOT:**
+
+- Touch the collateral `vault`. Bonds escrow **only** in the separate bond vault
+  PDA (`["bond", market]`); the collateral conservation invariant is never involved.
+- Self-finalize a **disputed** assertion (`DisputeUnresolved`) — only the guardian
+  settles a contested one.
+- Steal a counterparty's bond outside the rules: on the disputed path the whole
+  `2 · bond` goes to whoever asserted the side the **guardian** rules correct, and
+  the payout destination is constrained to the stored asserter/disputer
+  (`winner_collateral` owner/mint are checked).
+
+**Bond economics.** A false assertion is costly: if challenged and ruled wrong, the
+asserter forfeits their `bond` to the disputer (and vice-versa). An honest asserter
+of an uncontested outcome simply reclaims their bond. This makes the *expected* cost
+of asserting a wrong outcome positive, so honest assertion is the equilibrium —
+the guardian is only invoked on the contested path.
+
+**Guardian as dispute arbiter (extra power on optimistic markets).** On these
+markets the guardian's `resolve_dispute(correct_outcome)` **picks the correct
+outcome** (and routes `2 · bond` to the matching asserter), rather than only vetoing
+into a 50/50 void as on trusted/oracle markets. `dispute_void` is disabled here. So
+a compromised guardian on an optimistic market could mis-award a *disputed* bond and
+pick the wrong winning outcome — a strictly larger power than on the other kinds,
+and the locus of residual trust for optimistic settlement. Bonds remain isolated
+from collateral throughout.
+
 ### Upgrade authority (Solana BPF loader, off-program)
 
 **CAN:**
@@ -135,8 +186,9 @@ dies" — is bounded by four independent mechanisms:
 
 | Defense | Mechanism | Bounds which power |
 |---|---|---|
-| **Two-step resolution + timelock** | `propose_outcome` **or** `propose_from_oracle` → wait `dispute_period` → `finalize_outcome`. Payouts stay locked during the window. | A wrong/malicious resolver proposal — or a manipulated oracle feed — is not immediately actionable. |
-| **Guardian veto** | `dispute_void` during the window → `STATE_VOID` (50/50 refund). | A bad proposal, a compromised resolver, **or a manipulated `PriceFeed` value** (the oracle path enters the same window). |
+| **Two-step resolution + timelock** | `propose_outcome` / `propose_from_oracle` / `assert_outcome` → wait `dispute_period` → `finalize_outcome` / `finalize_assertion`. Payouts stay locked during the window. | A wrong/malicious resolver proposal, a manipulated oracle feed, **or a bonded optimistic assertion** is not immediately actionable. |
+| **Guardian veto / dispute settlement** | `dispute_void` during the window → `STATE_VOID` (50/50 refund) on trusted-key / oracle markets; `resolve_dispute(correct_outcome)` on a **disputed** optimistic market. | A bad proposal, a compromised resolver, a manipulated `PriceFeed` value (all enter the same window), or a contested optimistic assertion (settled bond-weighted to the correct side). |
+| **Bonded assert/dispute** | `RESOLVER_OPTIMISTIC`: anyone may `assert_outcome` (bond) and anyone may `dispute_assertion` (equal bond); the loser forfeits their bond to the winner. | A wrong optimistic assertion is *economically* costly and *challengeable* by anyone — not just vetoable. Bonds escrow in a **separate** vault, isolated from collateral. |
 | **Liveness escape hatch** | `void_stale` after `resolution_time + VOID_GRACE_PERIOD` (7 days) if still OPEN → `STATE_VOID`. Permissionless. | A resolver who never proposes; prevents permanently stranded collateral. |
 | **Pause switch** | `set_paused` by admin **or** guardian halts `buy`/`sell`/`seed_liquidity`. | Incident response while a fix is deployed. |
 
@@ -150,11 +202,20 @@ Additional structural guards:
   older than `oracle_max_staleness` (`StaleFeed`), so settlement cannot run on a
   silently-frozen feed; a feed that never refreshes leaves the market to the
   liveness hatch (`void_stale`) instead.
-- **`resolver_kind` + 64 reserved bytes** make room for pluggable oracle
-  resolvers **without a layout-breaking migration**. Two kinds are wired today —
-  `RESOLVER_TRUSTED_KEY = 0` (default) and `RESOLVER_ORACLE_FEED = 1` (the
-  feed-bridge adapter); native Switchboard-account parsing / Pyth / optimistic
-  remain future. Any unknown kind reverts with `UnsupportedResolverKind`.
+- **Optimistic bonds isolated from collateral.** Optimistic-resolver bonds escrow
+  in a dedicated bond vault PDA (`["bond", market]`), **separate** from the
+  collateral `vault`. Every settlement path nets the bond vault to zero (refund on
+  undisputed; `2 · bond` to the winner on disputed), so the
+  `vault == collateral + fee_accrued` invariant is never involved. The winner's
+  destination is constrained (owner/mint of `winner_collateral` checked against the
+  guardian's ruling).
+- **`resolver_kind` + 64 reserved bytes** make room for pluggable resolvers
+  **without a layout-breaking migration**. Three kinds are wired today —
+  `RESOLVER_TRUSTED_KEY = 0` (default), `RESOLVER_ORACLE_FEED = 1` (the feed-bridge
+  adapter), and `RESOLVER_OPTIMISTIC = 2` (bonded assert/dispute, binary only);
+  native Switchboard-account parsing and Pyth are **deferred** (see
+  [`ORACLE.md`](ORACLE.md) §11 for the toolchain-conflict evidence). Any unknown
+  kind reverts with `UnsupportedResolverKind`.
 - **Two-step admin transfer** (`set_admin` → `accept_admin`) prevents handing
   admin to a wrong/dead key in one step.
 
@@ -175,10 +236,20 @@ Even with the defenses above, you must trust:
    can only veto into a void, not correct the outcome) acting **within the dispute
    window**. If the value is wrong *and* the guardian fails to veto in time, the
    wrong side is paid.
-2. **The guardian is available and honest during dispute windows.** It is the
-   sole corrective for a bad proposal. A compromised guardian could grief by
-   voiding good resolutions (→ 50/50 refunds) or by pausing trading; it cannot
-   steal collateral or pick a winner.
+   For a `RESOLVER_OPTIMISTIC` market there is no proposer key at all: the outcome
+   is whatever survives the bonded assert/dispute game, and the **guardian settles a
+   dispute by picking the correct outcome** (residual trust #2). The bond makes a
+   wrong assertion costly and challengeable by anyone, but if a wrong assertion goes
+   *unchallenged* through the whole window, it finalizes — so honest, attentive
+   disputers are part of the assumption.
+2. **The guardian is available and honest during dispute windows.** On trusted-key
+   / oracle markets it is the sole corrective for a bad proposal; a compromised
+   guardian could grief by voiding good resolutions (→ 50/50 refunds) or by pausing,
+   but cannot steal collateral or pick a winner. **On `RESOLVER_OPTIMISTIC` markets
+   the guardian is strictly more powerful**: `resolve_dispute` lets it pick the
+   winning outcome of a *disputed* assertion and award the `2 · bond` escrow, so a
+   compromised guardian there could mis-settle a contested market. It still cannot
+   touch the collateral vault (bonds move only the separate bond vault).
 3. **The admin and upgrade authority keys are secure.** A compromised upgrade
    authority can replace the program entirely. A compromised admin can pause,
    change fees within the cap, and sweep the fee bucket — but not the collateral.
@@ -198,11 +269,9 @@ MVP for a finished oracle-backed protocol.
 - **Oracle resolution — a feed-bridge adapter now exists.** `RESOLVER_ORACLE_FEED`
   markets resolve permissionlessly from an on-chain `PriceFeed` that a Switchboard
   On-Demand Function or a committee multisig posts to, gated by the same dispute
-  window + guardian veto + a staleness guard (see [`ORACLE.md`](ORACLE.md)). What
-  remains future: **native Switchboard-account parsing in-program, a Pyth pull
-  oracle, and a Solana-native optimistic oracle.** The program reads a first-party
-  `PriceFeed` (the documented integration boundary); it does not parse Switchboard's
-  native account.
+  window + guardian veto + a staleness guard (see [`ORACLE.md`](ORACLE.md)). The
+  program reads a first-party `PriceFeed` (the documented integration boundary); it
+  does not parse Switchboard's native account.
 
 **Also now addressed:**
 
@@ -218,13 +287,41 @@ MVP for a finished oracle-backed protocol.
   `remove_liquidity` against a real per-(market, owner) `LiquidityPosition` share
   ledger (`market.total_shares`); `claim_pool` pays each LP their pro-rata slice.
   Adds preserve the price ratio and all share/slice rounding favors the pool /
-  existing LPs (see §5). **Still future:** routing a configurable fraction of taker
-  fees to LPs pro-rata (fees remain a separate admin bucket).
+  existing LPs (see §5).
+- **Fee-to-LP routing exists.** A configurable fraction of every taker fee
+  (`config.lp_fee_bps`, settable by `set_lp_fee_bps`) is **reinvested as pool
+  liquidity** — an equal `lp_cut` full set minted into the reserves
+  (`math::lp_fee_cut`, floored), lifting every LP's pro-rata claim with no per-LP
+  fee-debt accounting and no join-dilution. The protocol keeps `fee − lp_cut` in
+  `fee_accrued`. This adds **no new trust**: the conservation invariant
+  `vault == collateral + fee_accrued` is unchanged (the equal-set mint only moves
+  `lp_cut` from the would-be fee bucket into `collateral`); the only side effect is
+  a tiny, documented nudge of the marginal price toward 0.5.
+- **Optimistic oracle exists.** `RESOLVER_OPTIMISTIC` (binary only) resolves a
+  market via a UMA-style bonded assert/dispute game settled by the guardian, with
+  bonds escrowed in a **separate** bond vault isolated from collateral (see
+  [`ORACLE.md`](ORACLE.md) §10 and §1 above). It adds the guardian's
+  *dispute-arbiter* (outcome-picking) power on those markets.
+
+**Explicitly deferred (decision recorded, not dropped):**
+
+- **Native Switchboard On-Demand account parsing and a Pyth resolver kind are
+  deferred.** Probing them resolves a **second, conflicting `solana-program` 2.3.x**
+  alongside this program's Agave-4.0 / Anchor-0.31 `solana-program` 4.0.x — the
+  oracle crates' `AccountInfo`/types no longer typecheck against Anchor's, and
+  forcing alignment is a dependency-hell risk to the whole build. Switchboard is
+  also **redundant** with the shipped `PriceFeed` feed-bridge (which *is* the
+  On-Demand integration model), and **Pyth carries no GPU/compute feeds**
+  ([`RESEARCH.md`](RESEARCH.md) §6), so it is inapplicable to compute underlyings
+  and untestable on localnet. The `resolver_kind` enum + 64 reserved `Market` bytes
+  keep the door open to add them later. Full evidence in [`ORACLE.md`](ORACLE.md) §11.
 
 **Hard non-goals:**
 
-- **Guardian can only void, not correct.** A wrong outcome can be neutralized
-  (50/50 refund) but not fixed to the true outcome on-chain.
+- **Guardian can only void, not correct (trusted-key / oracle markets).** A wrong
+  outcome can be neutralized (50/50 refund) but not fixed to the true outcome
+  on-chain. (On `RESOLVER_OPTIMISTIC` markets the guardian *can* pick the correct
+  outcome of a disputed assertion — a deliberate, larger power on that kind only.)
 - **No Asian-VWAP / time-averaged settlement accumulator.** Resolution is a
   single proposed value, appropriate only because the resolver is trusted.
 - **Not audited.** No external security audit has been performed. Do not use with
@@ -237,8 +334,11 @@ The program's safety rests on these, asserted by unit/property tests
 
 - **Conservation.** `vault balance == market.collateral + market.fee_accrued` at
   all times. Outcome tokens are minted/burned only as full sets (including the
-  full set minted/sent-back on `add_liquidity`), so
-  `yes_supply == no_supply == market.collateral` while trading. Settlement
+  full set minted/sent-back on `add_liquidity` **and the `lp_cut` fee-reinvestment
+  set** — which adds `lp_cut` to both reserves and to `collateral`, moving it out of
+  the would-be fee bucket and leaving the invariant unchanged), so
+  `yes_supply == no_supply == market.collateral` while trading. Optimistic-resolver
+  bonds escrow in a **separate** bond vault and never enter this identity. Settlement
   conserves: binary RESOLVED pays winners 1:1 against `collateral`; scalar RESOLVED
   pays LONG `f` + SHORT `1 − f` (floored, so `long + short <= amount`); VOID pays
   half per token (`amount / 2`, rounded down) — none over-pays the vault.
@@ -276,6 +376,10 @@ The program's safety rests on these, asserted by unit/property tests
 | Compromised feed authority posts a manipulated value | `propose_from_oracle` enters the **same** dispute window; the guardian can `dispute_void` the resulting proposal → 50/50 refund. The bad value is *vetoable*, not final (residual trust #1). |
 | Oracle feed is frozen / never updated near resolution | `propose_from_oracle` reverts (`StaleFeed` / `FeedHasNoValue`); the market falls through to `void_stale` after `resolution_time + 7d`. No settlement on a stale value. |
 | Resolver disappears (never proposes) | After `resolution_time + 7d`, anyone `void_stale`s → 50/50 refund. Collateral is never permanently stranded. |
+| Optimistic asserter posts a wrong outcome | Anyone `dispute_assertion`s with an equal bond within the window → the guardian `resolve_dispute`s to the correct outcome, awarding the `2·bond` escrow to the disputer. The wrong asserter forfeits their bond. |
+| Wrong optimistic assertion goes unchallenged | If no one disputes before the window closes, `finalize_assertion` resolves to the (wrong) asserted outcome — the residual trust is honest, attentive disputers (residual trust #1). |
+| Asserter tries to dispute their own assertion to stall | Rejected: `dispute_assertion` reverts `SelfDispute`; a disputed assertion also reverts `AlreadyDisputed` on a second dispute. |
+| Attacker tries to redirect a bond payout to themselves | Rejected: `resolve_dispute` checks `winner_collateral` owner == the stored asserter/disputer and mint == collateral (`WrongOwner` / `WrongMint`); bonds also live only in the separate bond vault. |
 | Compromised admin | Can pause, set fee ≤ 10%, sweep `fee_accrued`. Cannot touch collateral, resolve, or void. |
 | Compromised guardian | Can pause and void good resolutions (grief). Cannot pick a winner or steal funds. |
 | Trader tries to extract value by round-tripping trades | Impossible: `k` is non-decreasing and rounding favors the pool; a buy-then-sell costs ≥ the tokens received. |

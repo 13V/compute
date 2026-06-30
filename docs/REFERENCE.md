@@ -8,7 +8,7 @@ IDL (`target/idl/compute_markets.json`).
 - **Program ID:** `8xv1L7757szxo2XPrQL5AERPGZrJaYRKgqB9RgFkQCU2`
 - **Anchor / Solana:** Anchor `0.31.1`, legacy SPL Token.
 - **Decimals:** collateral and outcome tokens use 6 decimals.
-- **Counts:** 25 instructions · 4 accounts · 15 events · 34 error variants.
+- **Counts:** 31 instructions · 4 accounts · 18 events · 38 error variants.
 
 > **Authoritative PDA layout.** The seeds below describe the **shipped binary
 > FPMM program** and supersede the generic PDA sketch in `docs/RESEARCH.md` §7
@@ -26,6 +26,7 @@ IDL (`target/idl/compute_markets.json`).
 | `STATE_VOID` | `3` | Voided; every token redeems for half collateral. |
 | `RESOLVER_TRUSTED_KEY` | `0` | Trusted single-key resolver (the default). |
 | `RESOLVER_ORACLE_FEED` | `1` | Oracle-feed resolver: resolved from a `PriceFeed` (see [`ORACLE.md`](ORACLE.md)). |
+| `RESOLVER_OPTIMISTIC` | `2` | Optimistic (UMA-style) bonded assert/dispute resolver; **binary markets only** (see [`ORACLE.md`](ORACLE.md) and the optimistic instructions below). |
 | `MARKET_BINARY` | `0` | Binary YES/NO market (the default). |
 | `MARKET_SCALAR` | `1` | Scalar/range market: YES=LONG, NO=SHORT; settles at a fraction `f`. |
 | `PRICE_SCALE` | `1_000_000` | Fixed-point scale (1e6) for prices and the scalar settlement fraction `f`. |
@@ -33,6 +34,7 @@ IDL (`target/idl/compute_markets.json`).
 | `CMP_LTE` | `1` | Oracle comparison: YES iff `feed.value <= oracle_strike`. |
 | `VOID_REASON_DISPUTE` | `0` | Voided by guardian veto. |
 | `VOID_REASON_STALE` | `1` | Voided by liveness escape hatch. |
+| `RESOLVER_OPTIMISTIC` | `2` | Optimistic bonded resolver (binary only); see the optimistic instructions. |
 | `MAX_FEE_BPS` | `1000` | Maximum protocol fee (10%). |
 | `MAX_DISPUTE_PERIOD` | `2_592_000` | 30 days, sanity bound on the timelock. |
 | `MAX_MARKET_HORIZON` | `~2 years` | Upper bound on `resolution_time` from creation. |
@@ -55,20 +57,23 @@ account's pubkey. All PDAs are derived from the program ID.
 | `pool_yes` | `["pool_yes", market]` | `seed_liquidity` | token authority = Market PDA |
 | `pool_no` | `["pool_no", market]` | `seed_liquidity` | token authority = Market PDA |
 | `LiquidityPosition` | `["lp", market, owner]` | `seed_liquidity` (creator) / `add_liquidity` (first add) | signer-bound to `owner` (`lp`) |
+| `bond_vault` | `["bond", market]` | `assert_outcome` (first assert) | token account; authority = Market PDA. Optimistic-resolver bond escrow, **separate** from `vault` (never touches the collateral invariant). |
 
 ## Instructions
 
-Twenty-five instructions. "Signer" is the privileged caller; remaining accounts are
+Thirty-one instructions. "Signer" is the privileged caller; remaining accounts are
 abbreviated (full lists are in the IDL). PDAs are derived as above. The three
 oracle instructions (`init_price_feed`, `publish_price`, `propose_from_oracle`) are
-detailed further in [`ORACLE.md`](ORACLE.md). Scalar-market resolution
-(`propose_scalar`, `redeem_scalar`) and multi-LP liquidity (`add_liquidity`,
-`remove_liquidity`) are summarized below; their mechanism is in
+detailed further in [`ORACLE.md`](ORACLE.md). The four optimistic-resolver
+instructions (`assert_outcome`, `dispute_assertion`, `finalize_assertion`,
+`resolve_dispute`) are also described in [`ORACLE.md`](ORACLE.md). Scalar-market
+resolution (`propose_scalar`, `redeem_scalar`) and multi-LP liquidity
+(`add_liquidity`, `remove_liquidity`) are summarized below; their mechanism is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) §§ 2.5–2.6.
 
 | # | Instruction | Args | Who may call | Signer | Effect |
 |---|---|---|---|---|---|
-| 1 | `initialize` | `fee_bps: u16`, `dispute_period: i64`, `guardian: Pubkey` | anyone (becomes admin) | `admin` | Create the singleton `Config`. One-time, irreversible. Validates `fee_bps <= 1000` and `0 <= dispute_period <= 30d`. |
+| 1 | `initialize` | `fee_bps: u16`, `lp_fee_bps: u16`, `dispute_period: i64`, `guardian: Pubkey`, `bond_amount: u64` | anyone (becomes admin) | `admin` | Create the singleton `Config`. One-time, irreversible. Validates `fee_bps <= 1000`, `lp_fee_bps <= 10_000` (fraction of the taker fee routed to LPs), and `0 <= dispute_period <= 30d`. `bond_amount` is the optimistic-resolver bond (`0` disables `assert_outcome`). |
 | 2 | `create_market` | `question: String`, `resolution_source: String`, `close_time: i64`, `resolution_time: i64`, `resolver: Pubkey`, `resolver_kind: u8`, `oracle_feed: Pubkey`, `oracle_strike: i64`, `oracle_comparison: u8`, `oracle_max_staleness: i64`, `market_kind: u8`, `lower_bound: i64`, `upper_bound: i64` | **anyone** (permissionless) | `creator` | Create a market + YES/NO mints + vault. Validates `close_time <= resolution_time`, `now < resolution_time <= now + horizon`, strings within length, and the resolver config **per kind** (`TRUSTED_KEY` ⇒ `resolver != default`; `ORACLE_FEED` ⇒ `oracle_feed != default`, `oracle_max_staleness > 0`, known `oracle_comparison`; else `UnsupportedResolverKind`). Also validates `market_kind`: `BINARY = 0` (bounds forced to 0), `SCALAR = 1` ⇒ `lower_bound < upper_bound` (else `InvalidScalarRange`), any other ⇒ `UnsupportedMarketKind`. Increments `market_count`. |
 | 3 | `seed_liquidity` | `amount: u64` | market `creator` only, once | `lp` (= creator) | Create the YES/NO pools, deposit `amount` collateral, mint `amount` of each outcome at 50/50, set `lp`/`total_shares = amount`, and **init the creator's `LiquidityPosition` with 100% of shares**. Requires `OPEN`, not paused, not already seeded, `amount > 0`. |
 | 4 | `buy` | `outcome: u8`, `collateral_in: u64`, `min_tokens_out: u64` | anyone | `user` | Invest collateral, mint a full set, swap out the bought side. Requires `OPEN`, not paused, `now < close_time`, liquidity present, `tokens_out >= min_tokens_out`. |
@@ -79,20 +84,26 @@ detailed further in [`ORACLE.md`](ORACLE.md). Scalar-market resolution
 | 9 | `propose_scalar` | `value: i64` | market `resolver` only | `resolver` | Step 1 of resolution for **SCALAR** markets (trusted key; `WrongMarketKind` on binary). `OPEN → RESOLVING`; records `proposed_value` + `resolved_at`. Requires `resolver_kind == TRUSTED_KEY`, `now >= resolution_time`. Opens the dispute window; the value is mapped to a fraction at finalize. Emits `ScalarProposed`. |
 | 10 | `propose_from_oracle` | — | **anyone** (crank) | `cranker` | Step 1 of resolution (oracle). `OPEN → RESOLVING`. For BINARY derives `proposed_outcome`; for SCALAR records the raw feed value as `proposed_value`. Requires `resolver_kind == ORACLE_FEED` (else `WrongResolverKind`), `now >= resolution_time`, `feed.published_at > 0` (else `FeedHasNoValue`), `now - published_at <= oracle_max_staleness` (else `StaleFeed`). `OutcomeProposed.resolver` is the feed pubkey. See [`ORACLE.md`](ORACLE.md). |
 | 11 | `finalize_outcome` | — | **anyone** (crank) | `cranker` | Step 2 of resolution. `RESOLVING → RESOLVED`. BINARY sets `outcome = proposed_outcome`; SCALAR computes `settlement_fraction = scalar_fraction(proposed_value, lower, upper)` (clamp into `[lower,upper]` mapped to `[0,1e6]`). Requires `now >= resolved_at + dispute_period`. Reused by both resolver and market kinds. Emits `MarketResolved` (now carries `settlement_fraction`). |
-| 12 | `dispute_void` | — | `guardian` only | `guardian` | Guardian veto. `RESOLVING → VOID` (reason DISPUTE). Requires `now < resolved_at + dispute_period` (within the window). Applies to both resolver and market kinds. |
-| 13 | `void_stale` | — | **anyone** (crank) | `cranker` | Liveness hatch. `OPEN → VOID` (reason STALE). Requires `now > resolution_time + 7d`. |
-| 14 | `redeem` | `amount: u64` | any winning-token holder | `user` | Burn `amount` winning tokens for `amount` collateral. **BINARY only** (else `WrongMarketKind`). Requires `RESOLVED`, correct `winning_mint`, `amount <= collateral`. |
-| 15 | `redeem_scalar` | `amount: u64` | any LONG/SHORT holder | `user` | Burn `amount` of a **SCALAR** market's LONG (`yes_mint`) or SHORT (`no_mint`) token; pays `scalar_payout(amount, settlement_fraction, is_long)` — LONG `amount·f/1e6`, SHORT `amount·(1e6−f)/1e6` (floored). `is_long` is inferred from the held mint. Requires `RESOLVED`, market kind SCALAR (else `WrongMarketKind`), payout `<= collateral`. |
-| 16 | `redeem_void` | `amount: u64` | any YES/NO holder | `user` | Burn `amount` of **either** outcome token for `amount / 2` collateral (rounded down). Requires `VOID`. |
-| 17 | `claim_pool` | — | LP (position owner) | `lp` | After settlement, the caller reclaims **their** pro-rata pool slice as collateral: per-LP `slice_i = floor(reserve_i·shares/total_shares)`, then BINARY pays the winning slice 1:1, SCALAR pays LONG slice at `f` + SHORT slice at `1−f`, VOID pays half of each slice. Burns the slices, zeroes the position. Requires `RESOLVED` or `VOID`, `position.shares > 0`. Emits `PoolClaimed` (now carries `provider`). |
-| 18 | `collect_fees` | — | `admin` only | `admin` | Sweep `fee_accrued` for this market to the admin's token account; resets it to 0. Requires `fee_accrued > 0`. |
-| 19 | `init_price_feed` | `description: String`, `decimals: u8` | anyone (becomes `authority`) | `feed` (new keypair) + `authority` | Create a fresh (non-PDA) `PriceFeed` account. Initializes `value = 0`, `published_at = 0`; caller becomes `authority`. Requires `description` ≤ 64 bytes. Emits `PriceFeedInitialized`. |
-| 20 | `publish_price` | `value: i64` | feed `authority` only | `authority` | Set `feed.value` and stamp `published_at = now`. Emits `PricePublished`. |
-| 21 | `set_paused` | `paused: bool` | `admin` **or** `guardian` | `authority` | Toggle the global pause flag. Emits `PausedSet`. |
-| 22 | `set_fee_bps` | `fee_bps: u16` | `admin` only | `admin` | Update the taker fee. Re-checks `fee_bps <= 1000`. |
-| 23 | `set_guardian` | `guardian: Pubkey` | `admin` only | `admin` | Replace the guardian key. |
-| 24 | `set_admin` | `new_admin: Pubkey` | `admin` only | `admin` | Two-step transfer step 1: nominate `pending_admin`. |
-| 25 | `accept_admin` | — | the nominated `pending_admin` | `pending_admin` | Two-step transfer step 2: accept; sets `admin`, clears `pending_admin`. |
+| 12 | `assert_outcome` | `outcome: u8` | **anyone** (permissionless) | `asserter` | Optimistic resolution step 1 (**`RESOLVER_OPTIMISTIC`, BINARY only**). Post `config.bond_amount` into the bond vault (`["bond", market]`) and `OPEN → RESOLVING` with `proposed_outcome = outcome`, `asserter`, `bond`, opening the dispute window. Requires `resolver_kind == OPTIMISTIC` (else `WrongResolverKind`), `BINARY` (else `WrongMarketKind`), `OPEN`, `now >= resolution_time`, `bond_amount > 0` (else `NoBondConfigured`). Emits `OutcomeAsserted`. |
+| 13 | `dispute_assertion` | — | **anyone** except the asserter | `disputer` | Optimistic resolution step 2a. Post an equal bond and mark the assertion `disputed`. Requires `OPTIMISTIC`, `RESOLVING`, `!disputed` (else `AlreadyDisputed`), within the window (`now < resolved_at + dispute_period`, else `DisputeWindowClosed`), `disputer != asserter` (else `SelfDispute`). Emits `AssertionDisputed`. |
+| 14 | `finalize_assertion` | — | the original `asserter` | `asserter` | Optimistic resolution step 2b: finalize an **undisputed** assertion after the window. Refunds the asserter's bond (PDA-signed from the bond vault) and `RESOLVING → RESOLVED` to the asserted outcome. Requires `OPTIMISTIC`, `RESOLVING`, `!disputed` (else `DisputeUnresolved`), `now >= resolved_at + dispute_period` (else `DisputeWindowOpen`), signer `== market.asserter` (else `Unauthorized`). Emits `MarketResolved`. |
+| 15 | `resolve_dispute` | `correct_outcome: u8` | `guardian` only | `guardian` | Optimistic resolution step 2c: settle a **disputed** assertion. Pays the whole `2·bond` escrow (PDA-signed) to whoever asserted the side the guardian rules correct (asserter if `proposed_outcome == correct_outcome`, else disputer; `winner_collateral` owner/mint checked) and `RESOLVING → RESOLVED` to `correct_outcome`. Requires `OPTIMISTIC`, `RESOLVING`, `disputed` (else `DisputeUnresolved`). Emits `DisputeResolved`. |
+| 16 | `dispute_void` | — | `guardian` only | `guardian` | Guardian veto. `RESOLVING → VOID` (reason DISPUTE). Requires `now < resolved_at + dispute_period` (within the window) and `resolver_kind != OPTIMISTIC` (optimistic markets settle via `resolve_dispute`, else `WrongResolverKind`). Applies to both trusted-key and oracle-feed kinds. |
+| 17 | `void_stale` | — | **anyone** (crank) | `cranker` | Liveness hatch. `OPEN → VOID` (reason STALE). Requires `now > resolution_time + 7d`. |
+| 18 | `redeem` | `amount: u64` | any winning-token holder | `user` | Burn `amount` winning tokens for `amount` collateral. **BINARY only** (else `WrongMarketKind`). Requires `RESOLVED`, correct `winning_mint`, `amount <= collateral`. |
+| 19 | `redeem_scalar` | `amount: u64` | any LONG/SHORT holder | `user` | Burn `amount` of a **SCALAR** market's LONG (`yes_mint`) or SHORT (`no_mint`) token; pays `scalar_payout(amount, settlement_fraction, is_long)` — LONG `amount·f/1e6`, SHORT `amount·(1e6−f)/1e6` (floored). `is_long` is inferred from the held mint. Requires `RESOLVED`, market kind SCALAR (else `WrongMarketKind`), payout `<= collateral`. |
+| 20 | `redeem_void` | `amount: u64` | any YES/NO holder | `user` | Burn `amount` of **either** outcome token for `amount / 2` collateral (rounded down). Requires `VOID`. |
+| 21 | `claim_pool` | — | LP (position owner) | `lp` | After settlement, the caller reclaims **their** pro-rata pool slice as collateral: per-LP `slice_i = floor(reserve_i·shares/total_shares)`, then BINARY pays the winning slice 1:1, SCALAR pays LONG slice at `f` + SHORT slice at `1−f`, VOID pays half of each slice. Burns the slices, zeroes the position. Requires `RESOLVED` or `VOID`, `position.shares > 0`. Emits `PoolClaimed` (now carries `provider`). |
+| 22 | `collect_fees` | — | `admin` only | `admin` | Sweep `fee_accrued` for this market to the admin's token account; resets it to 0. Requires `fee_accrued > 0`. |
+| 23 | `init_price_feed` | `description: String`, `decimals: u8` | anyone (becomes `authority`) | `feed` (new keypair) + `authority` | Create a fresh (non-PDA) `PriceFeed` account. Initializes `value = 0`, `published_at = 0`; caller becomes `authority`. Requires `description` ≤ 64 bytes. Emits `PriceFeedInitialized`. |
+| 24 | `publish_price` | `value: i64` | feed `authority` only | `authority` | Set `feed.value` and stamp `published_at = now`. Emits `PricePublished`. |
+| 25 | `set_paused` | `paused: bool` | `admin` **or** `guardian` | `authority` | Toggle the global pause flag. Emits `PausedSet`. |
+| 26 | `set_fee_bps` | `fee_bps: u16` | `admin` only | `admin` | Update the taker fee. Re-checks `fee_bps <= 1000`. |
+| 27 | `set_lp_fee_bps` | `value: u16` | `admin` only | `admin` | Update `lp_fee_bps`, the fraction of the taker fee reinvested to LPs. Re-validated `<= 10_000` bps. |
+| 28 | `set_bond_amount` | `value: u64` | `admin` only | `admin` | Update `bond_amount`, the optimistic-resolver bond. No bound beyond type; `0` disables `assert_outcome`. |
+| 29 | `set_guardian` | `guardian: Pubkey` | `admin` only | `admin` | Replace the guardian key. |
+| 30 | `set_admin` | `new_admin: Pubkey` | `admin` only | `admin` | Two-step transfer step 1: nominate `pending_admin`. |
+| 31 | `accept_admin` | — | the nominated `pending_admin` | `pending_admin` | Two-step transfer step 2: accept; sets `admin`, clears `pending_admin`. |
 
 ### Account lists (key accounts per instruction)
 
@@ -111,13 +122,17 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 | `buy` / `sell` | `config`, `market` (mut), `yes_mint`/`no_mint`/`pool_yes`/`pool_no`/`vault` (mut), `user_outcome`, `user_collateral`, `user` (signer) |
 | `propose_outcome` / `propose_scalar` | `market` (mut), `resolver` (signer) |
 | `finalize_outcome` | `config`, `market` (mut), `cranker` (signer) |
+| `assert_outcome` | `config`, `market` (mut), `collateral_mint`, `bond_vault` (mut, PDA `["bond", market]`, init on first assert), `asserter_collateral`, `asserter` (signer) |
+| `dispute_assertion` | `config`, `market` (mut), `bond_vault` (mut), `disputer_collateral`, `disputer` (signer) |
+| `finalize_assertion` | `config`, `market` (mut), `bond_vault` (mut), `asserter_collateral`, `asserter` (signer, `== market.asserter`) |
+| `resolve_dispute` | `config`, `market` (mut), `bond_vault` (mut), `winner_collateral` (mut, owner/mint checked against the ruling), `guardian` (signer) |
 | `dispute_void` | `config`, `market` (mut), `guardian` (signer) |
 | `void_stale` | `market` (mut), `cranker` (signer) |
 | `redeem` / `redeem_scalar` / `redeem_void` | `market` (mut), `winning_mint`, `vault`, `user_outcome`, `user_collateral`, `user` (signer) |
 | `claim_pool` | `market` (mut), `yes_mint`/`no_mint`/`pool_yes`/`pool_no`/`vault` (mut), `lp_collateral`, `position` (mut, PDA `["lp", market, lp]`), `lp` (signer) |
 | `collect_fees` | `config`, `market` (mut), `vault`, `admin_collateral`, `admin` (signer) |
 | `set_paused` | `config` (mut), `authority` (signer) |
-| `set_fee_bps` / `set_guardian` / `set_admin` | `config` (mut), `admin` (signer) |
+| `set_fee_bps` / `set_lp_fee_bps` / `set_bond_amount` / `set_guardian` / `set_admin` | `config` (mut), `admin` (signer) |
 | `accept_admin` | `config` (mut), `pending_admin` (signer) |
 
 ## Accounts
@@ -131,9 +146,11 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 | `guardian` | `pubkey` | Can pause and `dispute_void` during the window. |
 | `collateral_mint` | `pubkey` | The single collateral mint all markets use. |
 | `fee_bps` | `u16` | Taker fee in basis points (≤ 1000). |
+| `lp_fee_bps` | `u16` | Fraction OF THE TAKER FEE reinvested to LPs, in basis points (`0..=10_000`); the remainder accrues to `fee_accrued`. Set at `initialize`, updated by `set_lp_fee_bps`. |
 | `dispute_period` | `i64` | Seconds between a proposed outcome and finalization. |
 | `market_count` | `u64` | Monotonic counter; next market's `market_id`. |
 | `paused` | `bool` | Global trading pause. |
+| `bond_amount` | `u64` | Bond required to `assert_outcome` / `dispute_assertion` on an optimistic market (`0` disables optimistic assertions). Set at `initialize`, updated by `set_bond_amount`. |
 | `bump` | `u8` | PDA bump. |
 
 ### `Market` (seeds `["market", market_id (u64 LE)]`)
@@ -143,7 +160,7 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 | `market_id` | `u64` | Sequential id; PDA seed. |
 | `creator` | `pubkey` | Who created the market and may seed it. |
 | `resolver` | `pubkey` | Key allowed to `propose_outcome`/`propose_scalar` (trusted-key markets). |
-| `resolver_kind` | `u8` | Resolver type: `0` TRUSTED_KEY (default) or `1` ORACLE_FEED. |
+| `resolver_kind` | `u8` | Resolver type: `0` TRUSTED_KEY (default), `1` ORACLE_FEED, or `2` OPTIMISTIC (binary only). |
 | `market_kind` | `u8` | Market type: `0` MARKET_BINARY (default) or `1` MARKET_SCALAR. |
 | `lower_bound` | `i64` | Scalar range lower bound `A` (both `0` for binary). |
 | `upper_bound` | `i64` | Scalar range upper bound `B`; requires `A < B` for scalar. |
@@ -164,7 +181,11 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 | `fee_accrued` | `u64` | Protocol fee bucket awaiting `collect_fees`. |
 | `state` | `u8` | `0` OPEN, `1` RESOLVING, `2` RESOLVED, `3` VOID. |
 | `outcome` | `u8` | Finalized winning outcome (valid once RESOLVED). |
-| `proposed_outcome` | `u8` | Outcome proposed by the resolver (valid in RESOLVING). |
+| `proposed_outcome` | `u8` | Outcome proposed by the resolver/asserter (valid in RESOLVING). |
+| `asserter` | `pubkey` | Optimistic resolver: who posted the open assertion's bond (`default` if none). |
+| `disputer` | `pubkey` | Optimistic resolver: who posted the matching dispute bond (`default` if none). |
+| `bond` | `u64` | Optimistic resolver: per-side bond escrowed in the bond vault (`0` once settled). |
+| `disputed` | `bool` | Optimistic resolver: the open assertion is contested (settles via `resolve_dispute`). |
 | `close_time` | `i64` | Unix time after which trading halts. |
 | `resolution_time` | `i64` | Earliest time the outcome may be proposed. |
 | `resolved_at` | `i64` | Time the outcome was proposed (dispute window start). |
@@ -215,6 +236,9 @@ committee multisig. See [`ORACLE.md`](ORACLE.md).
 | `TradeExecuted` | `market: pubkey`, `user: pubkey`, `is_buy: bool`, `outcome: u8`, `collateral: u64` (gross), `tokens: u64` |
 | `OutcomeProposed` | `market: pubkey`, `resolver: pubkey`, `outcome: u8`, `proposed_at: i64` |
 | `ScalarProposed` | `market: pubkey`, `resolver: pubkey`, `value: i64`, `proposed_at: i64` |
+| `OutcomeAsserted` | `market: pubkey`, `asserter: pubkey`, `outcome: u8`, `bond: u64`, `asserted_at: i64` |
+| `AssertionDisputed` | `market: pubkey`, `disputer: pubkey` |
+| `DisputeResolved` | `market: pubkey`, `outcome: u8`, `winner: pubkey` |
 | `MarketResolved` | `market: pubkey`, `outcome: u8`, `settlement_fraction: u32` (scalar `f`; `0` for binary), `resolved_at: i64` (finalize time) |
 | `MarketVoided` | `market: pubkey`, `reason: u8` (`0` DISPUTE, `1` STALE) |
 | `Redeemed` | `market: pubkey`, `user: pubkey`, `amount: u64` (burned), `payout: u64` (collateral) |
@@ -228,7 +252,10 @@ Note `OutcomeProposed` is emitted by **both** `propose_outcome` and
 `propose_from_oracle` (binary path); in the oracle case its `resolver` field
 carries the feed pubkey. `ScalarProposed` is the scalar analogue, emitted by
 `propose_scalar` (and the scalar branch of `propose_from_oracle` records the value
-similarly). Fifteen events in total.
+similarly). The optimistic resolver adds `OutcomeAsserted` (on `assert_outcome`),
+`AssertionDisputed` (on `dispute_assertion`), and `DisputeResolved` (on
+`resolve_dispute`); `finalize_assertion` reuses `MarketResolved`. Eighteen events
+in total.
 
 ## Errors
 
@@ -269,7 +296,11 @@ Anchor custom errors start at code `6000` (`0x1770`).
 | 6030 | `InvalidComparison` | Unknown `oracle_comparison` code (must be `0` GTE or `1` LTE). |
 | 6031 | `FeedHasNoValue` | The bound `PriceFeed` has never been published (`published_at == 0`). |
 | 6032 | `StaleFeed` | The feed value is older than `oracle_max_staleness` at proposal time. |
-| 6033 | `MathOverflow` | Arithmetic overflow / checked-math failure. |
+| 6033 | `NoBondConfigured` | `assert_outcome` attempted while `config.bond_amount == 0`. |
+| 6034 | `AlreadyDisputed` | The open assertion has already been disputed. |
+| 6035 | `SelfDispute` | The asserter cannot dispute their own assertion. |
+| 6036 | `DisputeUnresolved` | A disputed assertion must be settled by the guardian (`finalize_assertion` on a disputed assertion, or `resolve_dispute` on an undisputed one). |
+| 6037 | `MathOverflow` | Arithmetic overflow / checked-math failure. |
 
 ## FPMM math (off-chain reference)
 
@@ -281,6 +312,7 @@ The host-tested functions in `math.rs`, mirrored by the SDK quote helpers:
 | `quote_sell(reserve_sold, reserve_other, a)` | `tokens_in`, `new_reserve_sold = ceil(k/(reserve_other−a))`, `new_reserve_other = reserve_other − a`. Requires `a < reserve_other`. |
 | `marginal_price_micro(reserve_self, reserve_other)` | `reserve_other / (reserve_self + reserve_other) · 1e6` (probability ×1e6). |
 | `fee_amount(amount, fee_bps)` | `floor(amount · fee_bps / 10_000)`. |
+| `lp_fee_cut(fee, lp_fee_bps)` | `Some(floor(fee · lp_fee_bps / 10_000))` (u128 intermediate) — the slice of a taker `fee` reinvested to LPs. Floored so the LP cut never exceeds its fair share and the protocol cut (`fee − lp_cut`) is never shorted; `lp_fee_bps == 0 ⇒ 0`, `== 10_000 ⇒` the whole `fee`. |
 | `oracle_is_yes(value, strike, comparison)` | `Some(value >= strike)` for `CMP_GTE`, `Some(value <= strike)` for `CMP_LTE`, `None` for any other code. Exact integer comparison; boundary inclusive. |
 
 Scalar settlement (`PRICE_SCALE = 1e6`):

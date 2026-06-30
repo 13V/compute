@@ -1,12 +1,14 @@
 # Compute — Oracle-Feed Resolver
 
-This document describes the **oracle-feed resolver adapter**: how a market can be
-resolved permissionlessly from an on-chain numeric `PriceFeed` instead of a
-trusted human key. It covers the two resolver kinds, the `PriceFeed` account, the
-comparison/strike semantics, the permissionless `propose_from_oracle` flow and its
-staleness guard, how it composes with the existing dispute window + guardian veto,
-and how to wire a Switchboard On-Demand Function or a committee multisig as the
-feed authority.
+This document describes the non-trusted-key resolvers: the **oracle-feed resolver
+adapter** (how a market can be resolved permissionlessly from an on-chain numeric
+`PriceFeed` instead of a trusted human key) and the **optimistic resolver** (a
+UMA-style bonded assert/dispute game, §10). It covers the resolver kinds, the
+`PriceFeed` account, the comparison/strike semantics, the permissionless
+`propose_from_oracle` flow and its staleness guard, how they compose with the
+existing dispute window + guardian veto, how to wire a Switchboard On-Demand
+Function or a committee multisig as the feed authority, and the **deferral
+decision** (with evidence) for native Switchboard-account parsing and Pyth (§11).
 
 For the strategy behind oracle selection — why a *licensed-index bridge* is the
 recommended primary settlement engine, and which off-chain indices exist — see
@@ -14,13 +16,16 @@ recommended primary settlement engine, and which off-chain indices exist — see
 surface map see [`REFERENCE.md`](REFERENCE.md); for the trust analysis see
 [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
-> **What is wired today.** Only this **feed-bridge adapter** is implemented: the
-> program reads a first-party `PriceFeed` account that something else (a
-> Switchboard On-Demand Function or a committee) posts to. Native
-> Switchboard-account parsing, Pyth `PriceUpdateV2`, and a Solana-native
-> optimistic oracle remain **future** (designed-for, not built). The
-> documented integration boundary is the `PriceFeed` account: the program does
-> **not** parse Switchboard's native account format in-program.
+> **What is wired today.** Two non-trusted-key resolvers ship: the **feed-bridge
+> adapter** (`RESOLVER_ORACLE_FEED`, §§2–8) — the program reads a first-party
+> `PriceFeed` account that something else (a Switchboard On-Demand Function or a
+> committee) posts to — and the **optimistic resolver** (`RESOLVER_OPTIMISTIC`,
+> §10) — a UMA-style bonded assert/dispute game settled by the guardian. What
+> remains **deferred** (designed-for, not built): native Switchboard On-Demand
+> *account parsing* in-program and a Pyth `PriceUpdateV2` pull oracle — see §11
+> for the decision and its evidence. The documented integration boundary is the
+> `PriceFeed` account: the program does **not** parse Switchboard's native account
+> format in-program.
 
 ## 1. Two resolver kinds
 
@@ -30,13 +35,18 @@ Every market records a `resolver_kind: u8` at `create_market`:
 |---|---|---|
 | `RESOLVER_TRUSTED_KEY` | `0` | The market's `resolver` key calls `propose_outcome`. The default. |
 | `RESOLVER_ORACLE_FEED` | `1` | Anyone calls `propose_from_oracle`; the outcome is derived from the bound `PriceFeed` by comparing its value to the market's strike. |
+| `RESOLVER_OPTIMISTIC` | `2` | UMA-style bonded **assert/dispute** game (binary markets only): anyone `assert_outcome`s by posting a bond; undisputed assertions finalize, disputed ones are settled by the guardian. See §10. |
 
-The two paths are mutually exclusive and enforced:
+The paths are mutually exclusive and enforced:
 
 - `propose_outcome` requires `resolver_kind == RESOLVER_TRUSTED_KEY`; on an oracle
-  market it reverts with `WrongResolverKind`.
+  or optimistic market it reverts with `WrongResolverKind`.
 - `propose_from_oracle` requires `resolver_kind == RESOLVER_ORACLE_FEED`; on a
-  trusted-key market it reverts with `WrongResolverKind`.
+  trusted-key or optimistic market it reverts with `WrongResolverKind`.
+- `assert_outcome` / `dispute_assertion` / `finalize_assertion` / `resolve_dispute`
+  require `resolver_kind == RESOLVER_OPTIMISTIC` (else `WrongResolverKind`), and
+  `dispute_void` is **disabled** on optimistic markets (they settle disputes via
+  `resolve_dispute`, not the guardian 50/50 void).
 
 `create_market` validates the config per kind:
 
@@ -193,7 +203,7 @@ Conceptually:
 
 The program does **not** parse Switchboard's native account — the integration
 boundary is the first-party `PriceFeed`. Native `PriceUpdateV2`/Switchboard-account
-parsing in-program is a future enhancement.
+parsing in-program is **deferred** (with evidence) — see §11.
 
 ### B. Committee multisig (fallback)
 
@@ -266,12 +276,76 @@ before `resolution_time`), `propose_from_oracle` reverts (`FeedHasNoValue` /
 | Engine | Status |
 |---|---|
 | **Feed-bridge adapter** (this `PriceFeed` + `RESOLVER_ORACLE_FEED`) | **Wired.** |
-| Native Switchboard On-Demand account parsing in-program | Future. |
-| Pyth `PriceUpdateV2` pull oracle (crypto-priced legs) | Future. |
-| Solana-native optimistic oracle (subjective/AI-milestone markets) | Future. |
+| **Optimistic oracle** (`RESOLVER_OPTIMISTIC`, bonded assert/dispute — §10) | **Wired.** |
+| Native Switchboard On-Demand account parsing in-program | **Deferred** — see §11. |
+| Pyth `PriceUpdateV2` pull oracle (crypto-priced legs) | **Deferred** — see §11. |
 
 The 64 reserved bytes on `Market` plus the `resolver_kind` discriminator leave room
 to add the remaining engines without a layout-breaking migration. See
 [`RESEARCH.md`](RESEARCH.md) §6 for the full settlement-router design and
 manipulation-resistance measures (time-averaged settlement, median-of-sources,
 void-on-missing-data).
+
+## 10. The optimistic resolver (`RESOLVER_OPTIMISTIC = 2`)
+
+A market created with `resolver_kind = 2` (**binary only**) is resolved by a
+UMA-style **bonded assert/dispute** game instead of a trusted key or a feed. It
+reuses the existing `RESOLVING → RESOLVED` state machine and dispute window, but the
+proposed outcome comes from a *bonded assertion* and disputes are settled by the
+guardian as the dispute arbiter (the DVM / council stand-in).
+
+### Bonds live in a separate vault
+
+All bonds escrow into a **dedicated bond vault** PDA token account
+`["bond", market]` whose authority is the Market PDA — **distinct from the
+collateral `vault`**. The collateral vault and its conservation invariant
+(`vault == collateral + fee_accrued`) are therefore **never touched** by the
+optimistic flow, and the bond vault **nets to zero on every settlement path**.
+
+### Flow
+
+| Step | Instruction | Caller | Effect |
+|---|---|---|---|
+| 1. Assert | `assert_outcome(outcome)` | **anyone** (permissionless) | At/after `resolution_time`, post `config.bond_amount` into the bond vault and assert a binary `outcome`. `OPEN → RESOLVING`; records `asserter`, `proposed_outcome`, `bond`; opens the dispute window. Requires `bond_amount > 0` (else `NoBondConfigured`). Emits `OutcomeAsserted`. |
+| 2a. Finalize (undisputed) | `finalize_assertion()` | the `asserter` | After the window, if not disputed: refund the asserter's bond (PDA-signed) and resolve to the asserted outcome. `RESOLVING → RESOLVED`. Emits `MarketResolved`. |
+| 2b. Dispute | `dispute_assertion()` | **anyone except the asserter** | Within the window, post an **equal** bond and flag `disputed`. Blocks self-dispute (`SelfDispute`), double-dispute (`AlreadyDisputed`), and a closed window (`DisputeWindowClosed`). Emits `AssertionDisputed`. A disputed assertion can no longer self-finalize (`finalize_assertion` reverts `DisputeUnresolved`). |
+| 2c. Resolve dispute | `resolve_dispute(correct_outcome)` | `guardian` only | Settle a disputed assertion: award the **whole `2 · bond`** escrow (PDA-signed) to whoever asserted the side the guardian rules correct — the asserter if `proposed_outcome == correct_outcome`, else the disputer (the `winner_collateral` owner/mint are checked against the ruling, so the destination is constrained to the stored asserter/disputer) — and resolve to `correct_outcome`. `RESOLVING → RESOLVED`. Emits `DisputeResolved`. |
+
+`config.bond_amount` is set at `initialize` and updated by `set_bond_amount`
+(admin); `0` disables `assert_outcome`. Because the proposed outcome is bonded and
+the loser forfeits their bond to the winner, an honest asserter is paid back while a
+griefer loses `bond`; the guardian is the final arbiter only on the contested path.
+
+### Where the trust rests (optimistic)
+
+The optimistic resolver shifts settlement trust to **economic incentives plus the
+guardian as dispute arbiter**: anyone can assert, anyone can challenge a wrong
+assertion (the bond makes a false assertion costly), and only a *disputed* outcome
+needs the guardian — who, unlike the feed/trusted paths, here **picks the correct
+outcome** rather than merely vetoing into a void. See
+[`THREAT_MODEL.md`](THREAT_MODEL.md) for the full trust model.
+
+## 11. Deferred resolver kinds (native Switchboard account parsing, Pyth)
+
+Native **Switchboard On-Demand account parsing** and a **Pyth** (`PriceUpdateV2`)
+resolver kind were probed and are **deliberately deferred — not silently dropped**.
+The reasons, precisely:
+
+1. **Toolchain conflict (probed).** Adding `switchboard-on-demand` /
+   `pyth-solana-receiver-sdk` resolves a **second, conflicting `solana-program`
+   version (2.3.x)** alongside this program's Agave-4.0 / Anchor-0.31
+   `solana-program` (4.0.x). Anchor's `AccountInfo` (4.0) and the oracle crates'
+   types (2.3) are then incompatible, so any in-program parse fails to typecheck;
+   forcing version alignment is a deep dependency-hell risk to the whole build.
+2. **Switchboard is redundant with the bridge.** The shipped `PriceFeed`
+   feed-bridge **is** Switchboard On-Demand's integration model — an On-Demand
+   Function posts the value to an on-chain account, which `RESOLVER_ORACLE_FEED`
+   reads (§§2, 7). Native in-program account parsing adds little over the bridge.
+3. **Pyth is inapplicable to compute.** Pyth carries **no GPU/compute price feeds**
+   (per [`RESEARCH.md`](RESEARCH.md) §6), so it is only useful for
+   crypto-denominated markets — out of scope for compute underlyings — and is
+   untestable on localnet without fabricated accounts.
+
+The `resolver_kind` enum plus the **64 reserved `Market` bytes** still leave room to
+add either later if the toolchain or the available feeds change; nothing about the
+current layout precludes them.
