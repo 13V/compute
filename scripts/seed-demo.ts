@@ -137,6 +137,26 @@ async function main() {
     await send(await client.buyIxs(admin.publicKey, marketId, outcome, amount, q.tokensOut, usdcMint));
   }
 
+  // A multi-step "walk": many small trades trending toward `mainSide`, each
+  // followed by a smaller counter-trade, so the price chart shows a believable
+  // path instead of a single jump. `counterRatio` near 1 keeps a market ~50/50.
+  async function walk(
+    marketId: number,
+    mainSide: number,
+    mainTotal: number,
+    steps = 5,
+    counterRatio = 0.32
+  ) {
+    const other = mainSide === OUTCOME_YES ? OUTCOME_NO : OUTCOME_YES;
+    for (let i = 0; i < steps; i++) {
+      const wob = 0.6 + ((i * 37) % 7) / 10; // deterministic 0.6..1.2 wobble
+      const chunk = Math.max(1, Math.round((mainTotal * wob) / steps));
+      await move(marketId, mainSide, USDC(chunk));
+      const counter = Math.round(chunk * counterRatio);
+      if (counter > 0) await move(marketId, other, USDC(counter));
+    }
+  }
+
   // A published oracle price feed (decimals + integer value) referenced by the
   // oracle-resolved markets below.
   async function feed(label: string, decimals: number, value: number): Promise<PublicKey> {
@@ -266,26 +286,27 @@ async function main() {
     marketKind: MARKET_SCALAR, lowerBound: new BN(1), upperBound: new BN(15),
   }, 8000);
 
-  // ----- realistic two-sided order flow so prices aren't a flat 50/50 -----
-  console.log("Placing demo order flow ...");
+  // ----- realistic multi-step order flow (walks) so prices aren't a flat 50/50
+  // and the per-market price charts have a believable path -----
+  console.log("Placing demo order flow (multi-step walks) ...");
   // GPU rental rates
-  await move(gH100s, OUTCOME_YES, USDC(5200)); await move(gH100s, OUTCOME_NO, USDC(1400)); // implied ~$2.6
-  await move(gH100b, OUTCOME_YES, USDC(7000)); await move(gH100b, OUTCOME_NO, USDC(800));  // feed clears strike -> YES
-  await move(gH200, OUTCOME_YES, USDC(4200)); await move(gH200, OUTCOME_NO, USDC(1200));   // LONG lean
-  await move(gB200, OUTCOME_YES, USDC(3600)); await move(gB200, OUTCOME_NO, USDC(700));    // YES lean
-  await move(gA100, OUTCOME_YES, USDC(2200)); await move(gA100, OUTCOME_NO, USDC(700));    // expects the price to keep falling
+  await walk(gH100s, OUTCOME_YES, 5200);            // implied ~$2.6
+  await walk(gH100b, OUTCOME_YES, 6200, 5, 0.22);   // feed clears strike -> strong YES
+  await walk(gH200, OUTCOME_YES, 4200);             // LONG lean
+  await walk(gB200, OUTCOME_YES, 3400, 5, 0.25);    // YES lean
+  await walk(gA100, OUTCOME_YES, 2200);             // expects the price to keep falling
   // AI capability milestones
-  await move(aFrontier, OUTCOME_YES, USDC(2600)); await move(aFrontier, OUTCOME_NO, USDC(800));
-  await move(aOpen, OUTCOME_YES, USDC(2800)); await move(aOpen, OUTCOME_NO, USDC(500));    // strong YES
-  await move(aSwe, OUTCOME_YES, USDC(2600)); await move(aSwe, OUTCOME_NO, USDC(700));
-  await move(aElo, OUTCOME_NO, USDC(2200)); await move(aElo, OUTCOME_YES, USDC(1500));     // 1483 < 1500 -> slight NO
+  await walk(aFrontier, OUTCOME_YES, 2600);
+  await walk(aOpen, OUTCOME_YES, 2800, 5, 0.2);     // strong YES
+  await walk(aSwe, OUTCOME_YES, 2600);
+  await walk(aElo, OUTCOME_NO, 2000, 6, 0.85);      // 1483 < 1500 -> near tossup, slight NO
   // Hardware supply & power
-  await move(hRubin, OUTCOME_YES, USDC(2200)); await move(hRubin, OUTCOME_NO, USDC(600));
-  await move(hCowos, OUTCOME_YES, USDC(1500)); await move(hCowos, OUTCOME_NO, USDC(600));
-  await move(hPower, OUTCOME_NO, USDC(2000)); await move(hPower, OUTCOME_YES, USDC(1200)); // implied ~42 GW
+  await walk(hRubin, OUTCOME_YES, 2200);
+  await walk(hCowos, OUTCOME_YES, 1500);
+  await walk(hPower, OUTCOME_NO, 1800, 5, 0.6);     // implied ~44 GW
   // Cloud spot & inference cost
-  await move(cP5, OUTCOME_YES, USDC(3400)); await move(cP5, OUTCOME_NO, USDC(800));        // spot under strike -> YES
-  await move(cInf, OUTCOME_NO, USDC(2900)); await move(cInf, OUTCOME_YES, USDC(1200));     // implied ~$5
+  await walk(cP5, OUTCOME_YES, 3200, 5, 0.25);      // spot under strike -> YES
+  await walk(cInf, OUTCOME_NO, 2600, 5, 0.55);      // implied ~$6-7
   console.log("Demo order flow placed.");
 
   console.log("\n=== demo ready ===");

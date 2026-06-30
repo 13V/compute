@@ -1068,3 +1068,127 @@ input:focus-visible,
   .spinner { animation-duration: 1.4s; }
   .tick-flash { animation: none; }
 }
+
+/* ============================================================
+   Compute ticker strip (components/ComputeTicker.tsx)
+   ============================================================ */
+.ticker {
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  padding: 9px 0;
+  margin-bottom: 18px;
+  position: relative;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
+}
+.ticker-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 28px;
+  white-space: nowrap;
+  will-change: transform;
+  animation: ticker-scroll 40s linear infinite;
+}
+.ticker:hover .ticker-track { animation-play-state: paused; }
+@keyframes ticker-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.tick { display: inline-flex; align-items: baseline; gap: 8px; }
+.tick-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.tick-value {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--yes-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   Discovery: nav link, filters, search
+   ============================================================ */
+.navlink {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+.navlink:hover { color: var(--text); text-decoration: none; background: var(--panel-2); }
+.navlink.active { color: var(--text); }
+
+.discovery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.cat-tabs { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.cat-tab {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 13px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.cat-tab:hover { color: var(--text); border-color: var(--border); }
+.cat-tab.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(108, 140, 255, 0.12);
+}
+.cat-tab .count { color: var(--muted-2); margin-left: 6px; font-weight: 500; }
+.discovery-spacer { flex: 1 1 auto; }
+.search-input {
+  max-width: 240px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 11px;
+  font-size: 14px;
+}
+.search-input:focus { outline: none; border-color: var(--accent); }
+.sort-select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 11px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.hero-cta { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+.badge.cat { color: var(--muted-2); border-color: var(--border-soft); background: var(--panel-2); }
+
+/* Buy-panel payout highlight (pages/market/[id].tsx) */
+.payout-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(46, 194, 138, 0.12), rgba(46, 194, 138, 0.04));
+  border: 1px solid rgba(46, 194, 138, 0.35);
+}
+.payout-cap { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.payout-val { font-size: 18px; font-weight: 700; color: var(--yes-bright); font-variant-numeric: tabular-nums; }
+.payout-mult {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--yes);
+  font-variant-numeric: tabular-nums;
+}

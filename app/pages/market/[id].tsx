@@ -19,6 +19,9 @@ import { ProbBar } from "../index";
 import { RPC_URL } from "../../components/WalletProviders";
 import { useComputeClient, useReadClient } from "../../components/useComputeClient";
 import { useNow, marketStateLabel, StateBadge, CopyKey } from "../../components/ui";
+import { useToasts } from "../../components/tx";
+import PriceChart from "../../components/PriceChart";
+import { fetchPriceHistory, type PricePoint } from "../../components/history";
 import type {
   MarketAccount,
   ConfigAccount,
@@ -207,10 +210,61 @@ export default function MarketPage() {
     loadBalances();
   }, [loadBalances]);
 
+  // The market PDA (for live subscription + history).
+  const marketPubkey = useMemo(
+    () => (idValid && rawId !== undefined ? marketPda(new BN(rawId))[0] : null),
+    [idValid, rawId]
+  );
+
+  // Price history (from TradeExecuted events) for the chart.
+  const [history, setHistory] = useState<PricePoint[]>([]);
+  const loadHistory = useCallback(async () => {
+    if (!marketPubkey) return;
+    try {
+      const pts = await fetchPriceHistory(readClient.program, marketPubkey);
+      setHistory(pts);
+    } catch {
+      /* history is best-effort */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marketPubkey?.toBase58(), readClient]);
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
   const refreshAll = useCallback(async () => {
     await loadMarket();
     await loadBalances();
-  }, [loadMarket, loadBalances]);
+    await loadHistory();
+  }, [loadMarket, loadBalances, loadHistory]);
+
+  // Real-time: keep the market ticking and grow the chart as trades land.
+  useEffect(() => {
+    if (!marketPubkey) return;
+    const sub = connection.onAccountChange(
+      marketPubkey,
+      async () => {
+        try {
+          const m = (await readClient.program.account.market.fetch(
+            marketPubkey
+          )) as unknown as MarketAccount;
+          setMarket(m);
+          const yesPrice = marginalPrice(m.reserveYes, m.reserveNo);
+          setHistory((h) => [
+            ...h,
+            { time: Math.floor(Date.now() / 1000), price: Math.min(0.999, Math.max(0.001, yesPrice)) },
+          ]);
+        } catch {
+          /* ignore transient decode errors */
+        }
+      },
+      { commitment: "confirmed" }
+    );
+    return () => {
+      connection.removeAccountChangeListener(sub);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marketPubkey?.toBase58(), connection, readClient]);
 
   // Send a transaction built from instructions, then refresh.
   const sendIxs = useCallback(
@@ -233,24 +287,40 @@ export default function MarketPage() {
     [wallet, connection]
   );
 
+  const { push, update } = useToasts();
   const runAction = useCallback(
-    async (build: () => Promise<TransactionInstruction[]>) => {
+    async (
+      build: () => Promise<TransactionInstruction[]>,
+      label = "Transaction"
+    ) => {
       setBusy(true);
       setTxError(null);
       setTxSig(null);
+      const id = push({ label, status: "building" });
       try {
         const ixs = await build();
+        update(id, { status: "signing" });
         const sig = await sendIxs(ixs);
+        update(id, { status: "success", sig });
         setTxSig(sig);
+        // Celebrate a successful claim/redeem.
+        if (/claim|redeem/i.test(label)) {
+          import("canvas-confetti")
+            .then((m) =>
+              m.default({ particleCount: 90, spread: 70, origin: { y: 0.7 } })
+            )
+            .catch(() => {});
+        }
         await refreshAll();
       } catch (e: any) {
-        // Decode program errors before surfacing.
-        setTxError(client ? client.parseError(e) : readClient.parseError(e));
+        const msg = client ? client.parseError(e) : readClient.parseError(e);
+        update(id, { status: "error", message: msg });
+        setTxError(msg);
       } finally {
         setBusy(false);
       }
     },
-    [sendIxs, refreshAll, client, readClient]
+    [sendIxs, refreshAll, client, readClient, push, update]
   );
 
   const copySig = useCallback(async () => {
@@ -470,6 +540,17 @@ export default function MarketPage() {
             <span>Voided — 50/50 refund</span>
           </div>
         )}
+      </div>
+
+      {/* Price history chart */}
+      <div className="card">
+        <div className="flex-between" style={{ marginBottom: 8 }}>
+          <strong>Price history</strong>
+          <span className="small muted">
+            {scalar ? "LONG probability" : "YES probability"} over time
+          </span>
+        </div>
+        <PriceChart points={history} />
       </div>
 
       {/* Config / protocol panel */}
@@ -1075,11 +1156,36 @@ function BuyPanel({
             <span>{formatUnits(preview.minOut)}</span>
           </div>
           <div className="kv">
+            <span className="k">Avg price</span>
+            <span>
+              {(() => {
+                const i = parsed ? parsed.toNumber() : 0;
+                const o = preview.tokensOut.toNumber();
+                return o > 0 ? formatPct(i / o) : "—";
+              })()}
+            </span>
+          </div>
+          <div className="kv">
             <span className="k">Price impact</span>
             <span>
               {formatPct(preview.priceBefore)} → {formatPct(preview.priceAfter)} (
               {(impact * 100).toFixed(2)} pts)
             </span>
+          </div>
+          <div className="payout-line">
+            <div>
+              <div className="payout-cap">Payout if {lab} wins</div>
+              <div className="payout-val">
+                {formatUnits(preview.tokensOut)} USDC
+              </div>
+            </div>
+            <div className="payout-mult">
+              {(() => {
+                const i = parsed ? parsed.toNumber() : 0;
+                const o = preview.tokensOut.toNumber();
+                return i > 0 ? `${(o / i).toFixed(2)}×` : "—";
+              })()}
+            </div>
           </div>
         </div>
       )}

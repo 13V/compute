@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import BN from "bn.js";
 import TopBar from "../components/TopBar";
 import { RPC_URL } from "../components/WalletProviders";
 import { useReadClient } from "../components/useComputeClient";
 import { useNow, marketStateLabel, StateBadge } from "../components/ui";
+import { useLiveMarkets } from "../components/useLive";
+import ComputeTicker from "../components/ComputeTicker";
+import Faucet from "../components/Faucet";
+import { categoryOf, categoryShort, CATEGORIES, CategoryKey } from "../components/category";
 import type { MarketEntry } from "../components/types";
 import {
   isScalar,
@@ -20,12 +24,14 @@ import {
   formatRelTime,
   clusterFromRpc,
 } from "../lib/format";
-import { STATE_RESOLVED, STATE_VOID, OUTCOME_YES } from "../lib/pdas";
+import { STATE_OPEN, STATE_RESOLVED, STATE_VOID, OUTCOME_YES } from "../lib/pdas";
 import { marginalPrice as marginal } from "../lib/amm";
 import {
   settledScalarValue,
   settledLongFraction,
 } from "../components/market";
+
+type SortKey = "newest" | "closing" | "tvl";
 
 function fmtNum(n: number): string {
   // Trim to at most 2 decimals, drop trailing zeros.
@@ -114,10 +120,66 @@ export default function Home() {
     load();
   }, [load]);
 
+  // Real-time: subscribe to every market account so the cards tick live.
+  const { live, version } = useLiveMarkets(markets);
+
+  // Discovery state.
+  const [cat, setCat] = useState<CategoryKey | "all">("all");
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<SortKey>("newest");
+
+  // Merge in the latest live account for each market.
+  const liveEntries = useMemo<MarketEntry[] | null>(() => {
+    if (!markets) return null;
+    return markets.map((m) => ({
+      publicKey: m.publicKey,
+      account: live[m.publicKey.toBase58()] ?? m.account,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [markets, version]);
+
+  // Per-category counts (over the full set).
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { all: liveEntries?.length ?? 0 };
+    for (const cat of CATEGORIES) c[cat.key] = 0;
+    for (const m of liveEntries ?? []) {
+      const k = categoryOf(m.account);
+      c[k] = (c[k] ?? 0) + 1;
+    }
+    return c;
+  }, [liveEntries]);
+
+  // Filtered + sorted list to render.
+  const display = useMemo(() => {
+    if (!liveEntries) return null;
+    let list = liveEntries;
+    if (cat !== "all") list = list.filter((m) => categoryOf(m.account) === cat);
+    const q = query.trim().toLowerCase();
+    if (q) {
+      list = list.filter(
+        (m) =>
+          m.account.question.toLowerCase().includes(q) ||
+          m.account.resolutionSource.toLowerCase().includes(q)
+      );
+    }
+    const sorted = [...list];
+    sorted.sort((a, b) => {
+      if (sort === "tvl") return b.account.collateral.cmp(a.account.collateral);
+      if (sort === "closing") {
+        const ao = a.account.state === STATE_OPEN ? 0 : 1;
+        const bo = b.account.state === STATE_OPEN ? 0 : 1;
+        if (ao !== bo) return ao - bo;
+        return a.account.closeTime.cmp(b.account.closeTime);
+      }
+      return b.account.marketId.cmp(a.account.marketId); // newest
+    });
+    return sorted;
+  }, [liveEntries, cat, query, sort]);
+
   const cluster = clusterFromRpc(RPC_URL);
   // Hero stats derived from already-loaded data.
   const marketCount = markets?.length ?? 0;
-  const totalTvl = (markets ?? []).reduce(
+  const totalTvl = (liveEntries ?? []).reduce(
     (acc, m) => acc.add(m.account.collateral),
     new BN(0)
   );
@@ -140,6 +202,12 @@ export default function Home() {
             AI milestones. Take a position on where the future of compute is
             headed — settled trustlessly on Solana.
           </p>
+          <div className="hero-cta">
+            <Faucet className="btn" />
+            <span className="small muted">
+              Free test USDC — connect a wallet and trade in seconds.
+            </span>
+          </div>
         </div>
         <div className="hero-stats">
           <span className="stat-chip">
@@ -157,12 +225,54 @@ export default function Home() {
         </div>
       </section>
 
+      <ComputeTicker markets={liveEntries} />
+
       <div className="flex-between" style={{ marginBottom: 14 }}>
         <h2 style={{ margin: 0 }}>Markets</h2>
         <button className="btn secondary" onClick={load} disabled={loading}>
           {loading ? "Loading…" : "Refresh"}
         </button>
       </div>
+
+      {markets && markets.length > 0 && (
+        <div className="discovery">
+          <div className="cat-tabs">
+            <button
+              className={`cat-tab ${cat === "all" ? "active" : ""}`}
+              onClick={() => setCat("all")}
+            >
+              All <span className="count">{counts.all}</span>
+            </button>
+            {CATEGORIES.map((c) => (
+              <button
+                key={c.key}
+                className={`cat-tab ${cat === c.key ? "active" : ""}`}
+                onClick={() => setCat(c.key)}
+              >
+                {c.short} <span className="count">{counts[c.key] ?? 0}</span>
+              </button>
+            ))}
+          </div>
+          <div className="discovery-spacer" />
+          <input
+            className="search-input"
+            placeholder="Search markets…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search markets"
+          />
+          <select
+            className="sort-select"
+            value={sort}
+            onChange={(e) => setSort(e.target.value as SortKey)}
+            aria-label="Sort markets"
+          >
+            <option value="newest">Newest</option>
+            <option value="closing">Closing soon</option>
+            <option value="tvl">Top TVL</option>
+          </select>
+        </div>
+      )}
 
       {error && (
         <div className="notice err">
@@ -198,10 +308,19 @@ export default function Home() {
         </div>
       )}
 
-      {markets &&
-        markets.map((m) => {
+      {display && markets && markets.length > 0 && display.length === 0 && (
+        <div className="empty">
+          <div className="icon" aria-hidden="true">⌕</div>
+          <div className="title">No markets match</div>
+          <div className="desc">Try a different category or clear your search.</div>
+        </div>
+      )}
+
+      {display &&
+        display.map((m) => {
           const a = m.account;
           const scalar = isScalar(a);
+          const catKey = categoryOf(a);
           // For scalar markets YES=LONG, NO=SHORT.
           const longPrice = marginal(a.reserveYes, a.reserveNo);
           const shortPrice = marginal(a.reserveNo, a.reserveYes);
@@ -235,6 +354,7 @@ export default function Home() {
                 <span className={`badge resolver ${resolverKindClass(a.resolverKind)}`}>
                   {resolverKindLabel(a.resolverKind)}
                 </span>
+                <span className="badge cat">{categoryShort(catKey)}</span>
               </div>
               <div className="small muted" style={{ marginTop: 6 }}>
                 Source: {a.resolutionSource || "—"}

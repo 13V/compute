@@ -1,0 +1,162 @@
+/* Portfolio-surface styles. Global theme tokens (--panel, --border, --muted,
+   --yes, --no, --accent, etc.) come from globals.css; only portfolio-specific
+   layout lives here. */
+
+/* TopBar nav link to /portfolio (imported into TopBar.tsx). */
+.navlink {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  white-space: nowrap;
+  transition: color 0.16s var(--ease), border-color 0.16s var(--ease),
+    background 0.16s var(--ease);
+}
+.navlink:hover {
+  color: var(--text);
+  text-decoration: none;
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* Summary stat tiles. */
+.summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+@media (max-width: 640px) {
+  .summary {
+    grid-template-columns: 1fr;
+  }
+}
+.tile {
+  background: linear-gradient(180deg, var(--panel) 0%, #11151f 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow-card);
+}
+.tileLabel {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.tileValue {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.tileValue.accent {
+  color: var(--accent);
+}
+.tileValue.good {
+  color: var(--yes);
+}
+
+/* A holding row. */
+.holding {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 16px;
+}
+.holdingMain {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.holdingSide {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 200px;
+}
+.qlink {
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  color: var(--text);
+}
+.qlink:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* Inline token-amount chips (reuses the .price-pill look at a smaller size). */
+.legs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.leg {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+}
+.legLab {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.legVal {
+  font-size: 14px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.leg.yes .legVal {
+  color: var(--yes);
+}
+.leg.no .legVal {
+  color: var(--no);
+}
+.leg.lp .legVal {
+  color: var(--accent);
+}
+
+/* P&L colouring. */
+.pnl {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+.pnl.up {
+  color: var(--yes);
+}
+.pnl.down {
+  color: var(--no);
+}
+
+.statusNote {
+  font-size: 13px;
+  color: var(--muted);
+  text-align: right;
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Header row with title + refresh. */
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
