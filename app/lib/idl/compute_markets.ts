@@ -202,6 +202,125 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "assertOutcome",
+      "docs": [
+        "Optimistic resolution, step 1 (PERMISSIONLESS): anyone asserts a binary",
+        "outcome by posting `config.bond_amount` collateral into the SEPARATE bond",
+        "vault. Opens the dispute window; the assertion either finalizes undisputed",
+        "(`finalize_assertion`, asserter reclaims the bond) or is disputed",
+        "(`dispute_assertion`) and settled by the guardian (`resolve_dispute`)."
+      ],
+      "discriminator": [
+        44,
+        170,
+        123,
+        232,
+        110,
+        150,
+        247,
+        36
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateralMint"
+        },
+        {
+          "name": "bondVault",
+          "docs": [
+            "The bond escrow, created on first assert. SEPARATE from `market.vault`, so",
+            "bonds never touch the collateral-conservation invariant."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "asserterCollateral",
+          "writable": true
+        },
+        {
+          "name": "asserter",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "outcome",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "buy",
       "docs": [
         "Buy `outcome` by investing `collateral_in`. Reverts if fewer than",
@@ -701,6 +820,103 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "disputeAssertion",
+      "docs": [
+        "Optimistic resolution, step 2a (PERMISSIONLESS): challenge an open assertion",
+        "by posting an equal bond into the bond vault, within the dispute window. A",
+        "disputed assertion can no longer finalize on its own — only the guardian's",
+        "`resolve_dispute` settles it (awarding both bonds to the correct asserter)."
+      ],
+      "discriminator": [
+        27,
+        132,
+        244,
+        216,
+        101,
+        77,
+        138,
+        55
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bondVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "disputerCollateral",
+          "writable": true
+        },
+        {
+          "name": "disputer",
+          "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "disputeVoid",
       "docs": [
         "Guardian veto: during the dispute window, void a proposed outcome (→ 50/50",
@@ -762,6 +978,106 @@ export type ComputeMarkets = {
         {
           "name": "guardian",
           "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "finalizeAssertion",
+      "docs": [
+        "Optimistic resolution, step 2b (PERMISSIONLESS): finalize an UNDISPUTED",
+        "assertion once the dispute window has elapsed. Refunds the asserter's bond",
+        "from the bond vault (PDA-signed) and resolves the market to the asserted",
+        "outcome. Disputed assertions must go through `resolve_dispute` instead."
+      ],
+      "discriminator": [
+        104,
+        239,
+        27,
+        154,
+        183,
+        226,
+        14,
+        1
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bondVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "asserterCollateral",
+          "writable": true
+        },
+        {
+          "name": "asserter",
+          "docs": [
+            "The original asserter (must match `market.asserter`); reclaims the bond."
+          ],
+          "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": []
@@ -886,7 +1202,9 @@ export type ComputeMarkets = {
         "* `lp_fee_bps` — fraction OF THE TAKER FEE routed to LPs, in basis points",
         "(0..=10_000; 10_000 = the entire fee to LPs).",
         "* `dispute_period` — seconds between a proposed outcome and payout unlock.",
-        "* `guardian` — key allowed to pause and to veto a proposed outcome."
+        "* `guardian` — key allowed to pause and to veto a proposed outcome.",
+        "* `bond_amount` — the bond required to `assert_outcome` / `dispute_assertion`",
+        "on an optimistic-resolver market (0 disables optimistic assertions)."
       ],
       "discriminator": [
         175,
@@ -947,6 +1265,10 @@ export type ComputeMarkets = {
         {
           "name": "guardian",
           "type": "pubkey"
+        },
+        {
+          "name": "bondAmount",
+          "type": "u64"
         }
       ]
     },
@@ -1498,6 +1820,113 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "resolveDispute",
+      "docs": [
+        "Optimistic resolution, step 2c (GUARDIAN only): settle a DISPUTED assertion.",
+        "The guardian (the DVM / council stand-in) declares the `correct_outcome`;",
+        "the whole `2 * bond` escrow goes to whoever asserted it (the asserter if",
+        "`proposed_outcome == correct_outcome`, else the disputer), PDA-signed out of",
+        "the bond vault. The market resolves to `correct_outcome`."
+      ],
+      "discriminator": [
+        231,
+        6,
+        202,
+        6,
+        96,
+        103,
+        12,
+        230
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bondVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "winnerCollateral",
+          "docs": [
+            "The winner's collateral ATA — its owner/mint are checked in the handler",
+            "against the guardian's ruling (asserter or disputer)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "guardian",
+          "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "correctOutcome",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "seedLiquidity",
       "docs": [
         "Seed the AMM with initial liquidity at 50/50 odds. Callable once, by the",
@@ -1829,6 +2258,54 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "setBondAmount",
+      "docs": [
+        "Update the optimistic-resolver bond (admin only). No bound beyond type; 0",
+        "disables `assert_outcome`."
+      ],
+      "discriminator": [
+        190,
+        139,
+        80,
+        7,
+        10,
+        199,
+        21,
+        2
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "value",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "setFeeBps",
       "docs": [
         "Update the taker fee (admin only), re-checked against `MAX_FEE_BPS`."
@@ -2121,6 +2598,32 @@ export type ComputeMarkets = {
   ],
   "events": [
     {
+      "name": "assertionDisputed",
+      "discriminator": [
+        171,
+        153,
+        23,
+        45,
+        153,
+        155,
+        200,
+        250
+      ]
+    },
+    {
+      "name": "disputeResolved",
+      "discriminator": [
+        121,
+        64,
+        249,
+        153,
+        139,
+        128,
+        236,
+        187
+      ]
+    },
+    {
       "name": "feesCollected",
       "discriminator": [
         233,
@@ -2209,6 +2712,19 @@ export type ComputeMarkets = {
         75,
         89,
         26
+      ]
+    },
+    {
+      "name": "outcomeAsserted",
+      "discriminator": [
+        115,
+        44,
+        90,
+        18,
+        8,
+        191,
+        8,
+        107
       ]
     },
     {
@@ -2484,11 +3000,47 @@ export type ComputeMarkets = {
     },
     {
       "code": 6033,
+      "name": "noBondConfigured",
+      "msg": "No bond is configured for optimistic assertions"
+    },
+    {
+      "code": 6034,
+      "name": "alreadyDisputed",
+      "msg": "Assertion has already been disputed"
+    },
+    {
+      "code": 6035,
+      "name": "selfDispute",
+      "msg": "Cannot dispute your own assertion"
+    },
+    {
+      "code": 6036,
+      "name": "disputeUnresolved",
+      "msg": "Disputed assertion must be settled by the guardian"
+    },
+    {
+      "code": 6037,
       "name": "mathOverflow",
       "msg": "Arithmetic overflow"
     }
   ],
   "types": [
+    {
+      "name": "assertionDisputed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "disputer",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
     {
       "name": "config",
       "type": {
@@ -2535,8 +3087,36 @@ export type ComputeMarkets = {
             "type": "bool"
           },
           {
+            "name": "bondAmount",
+            "docs": [
+              "Bond required to `assert_outcome` / `dispute_assertion` on an optimistic",
+              "market (0 disables optimistic assertions). Settable via `set_bond_amount`."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "bump",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "disputeResolved",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "outcome",
+            "type": "u8"
+          },
+          {
+            "name": "winner",
+            "type": "pubkey"
           }
         ]
       }
@@ -2804,6 +3384,28 @@ export type ComputeMarkets = {
             "type": "u8"
           },
           {
+            "name": "asserter",
+            "docs": [
+              "Optimistic resolver (`RESOLVER_OPTIMISTIC`) bookkeeping. `asserter` posted",
+              "the open assertion's bond; `disputer` (if any) posted the matching bond;",
+              "`bond` is the per-side bond escrowed in the bond vault (0 once settled);",
+              "`disputed` flags that the assertion is contested (→ `resolve_dispute`)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "disputer",
+            "type": "pubkey"
+          },
+          {
+            "name": "bond",
+            "type": "u64"
+          },
+          {
+            "name": "disputed",
+            "type": "bool"
+          },
+          {
             "name": "closeTime",
             "type": "i64"
           },
@@ -2913,6 +3515,34 @@ export type ComputeMarkets = {
           {
             "name": "reason",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "outcomeAsserted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "asserter",
+            "type": "pubkey"
+          },
+          {
+            "name": "outcome",
+            "type": "u8"
+          },
+          {
+            "name": "bond",
+            "type": "u64"
+          },
+          {
+            "name": "assertedAt",
+            "type": "i64"
           }
         ]
       }

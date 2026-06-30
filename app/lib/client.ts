@@ -21,6 +21,7 @@ import {
   deriveMarketAccounts,
   marketPda,
   liquidityPositionPda,
+  bondVaultPda,
   OUTCOME_YES,
   MARKET_BINARY,
 } from "./pdas";
@@ -108,11 +109,12 @@ export class ComputeClient {
     feeBps: number,
     disputePeriod: BN,
     guardian: PublicKey,
-    lpFeeBps?: number
+    lpFeeBps?: number,
+    bondAmount?: BN
   ) {
     const [config] = configPda(this.programId);
     return this.program.methods
-      .initialize(feeBps, lpFeeBps ?? 0, disputePeriod, guardian)
+      .initialize(feeBps, lpFeeBps ?? 0, disputePeriod, guardian, bondAmount ?? new BN(0))
       .accountsPartial({ config, collateralMint, admin, systemProgram: SystemProgram.programId })
       .instruction();
   }
@@ -389,6 +391,109 @@ export class ComputeClient {
       .instruction();
   }
 
+  // ----- optimistic-oracle resolver (UMA-style bonded assert + dispute) -----
+
+  /**
+   * Permissionlessly assert a binary `outcome` by posting the configured bond into
+   * the SEPARATE bond vault. Returns `[ensureCollateralAtaIx, assertIx]` so the
+   * asserter's collateral ATA always exists (it normally does in tests).
+   */
+  async assertOutcomeIxs(
+    asserter: PublicKey,
+    marketId: number | BN,
+    outcome: number,
+    collateralMint: PublicKey
+  ): Promise<TransactionInstruction[]> {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const [bondVault] = bondVaultPda(a.market, this.programId);
+    const asserterCollateral = getAssociatedTokenAddressSync(collateralMint, asserter);
+    const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+      asserter,
+      asserterCollateral,
+      asserter,
+      collateralMint
+    );
+    const ix = await this.program.methods
+      .assertOutcome(outcome)
+      .accountsPartial({
+        config: configPda(this.programId)[0],
+        market: a.market,
+        collateralMint,
+        bondVault,
+        asserterCollateral,
+        asserter,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .instruction();
+    return [ataIx, ix];
+  }
+
+  /** Permissionlessly dispute an open assertion by posting a matching bond. */
+  async disputeAssertionIx(disputer: PublicKey, marketId: number | BN, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const [bondVault] = bondVaultPda(a.market, this.programId);
+    const disputerCollateral = getAssociatedTokenAddressSync(collateralMint, disputer);
+    return this.program.methods
+      .disputeAssertion()
+      .accountsPartial({
+        config: configPda(this.programId)[0],
+        market: a.market,
+        bondVault,
+        disputerCollateral,
+        disputer,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /** Finalize an UNDISPUTED assertion after the window; refunds the asserter's bond. */
+  async finalizeAssertionIx(asserter: PublicKey, marketId: number | BN, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const [bondVault] = bondVaultPda(a.market, this.programId);
+    const asserterCollateral = getAssociatedTokenAddressSync(collateralMint, asserter);
+    return this.program.methods
+      .finalizeAssertion()
+      .accountsPartial({
+        config: configPda(this.programId)[0],
+        market: a.market,
+        bondVault,
+        asserterCollateral,
+        asserter,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /**
+   * Guardian-only: settle a disputed assertion to `correctOutcome`. The 2×bond
+   * escrow goes to the winner (the asserter if their proposed outcome was correct,
+   * else the disputer); pass that winner's pubkey as `winner`.
+   */
+  async resolveDisputeIx(
+    guardian: PublicKey,
+    marketId: number | BN,
+    correctOutcome: number,
+    winner: PublicKey,
+    collateralMint: PublicKey
+  ) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const [bondVault] = bondVaultPda(a.market, this.programId);
+    const winnerCollateral = getAssociatedTokenAddressSync(collateralMint, winner);
+    return this.program.methods
+      .resolveDispute(correctOutcome)
+      .accountsPartial({
+        config: configPda(this.programId)[0],
+        market: a.market,
+        bondVault,
+        winnerCollateral,
+        guardian,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
   async disputeVoidIx(guardian: PublicKey, marketId: number | BN) {
     const a = deriveMarketAccounts(marketId, this.programId);
     return this.program.methods
@@ -504,6 +609,14 @@ export class ComputeClient {
   async setLpFeeBpsIx(admin: PublicKey, value: number) {
     return this.program.methods
       .setLpFeeBps(value)
+      .accountsPartial({ config: configPda(this.programId)[0], admin })
+      .instruction();
+  }
+
+  /** Set the optimistic-resolver bond required to assert/dispute (admin only). */
+  async setBondAmountIx(admin: PublicKey, value: BN) {
+    return this.program.methods
+      .setBondAmount(value)
       .accountsPartial({ config: configPda(this.programId)[0], admin })
       .instruction();
   }

@@ -34,10 +34,12 @@ import {
   ComputeClient,
   OUTCOME_YES,
   OUTCOME_NO,
+  STATE_OPEN,
   STATE_RESOLVED,
   STATE_VOID,
   STATE_RESOLVING,
   RESOLVER_ORACLE_FEED,
+  RESOLVER_OPTIMISTIC,
   MARKET_SCALAR,
   PRICE_SCALE,
   CMP_GTE,
@@ -47,6 +49,7 @@ import {
   marginalPrice,
   scalarPayout,
   deriveMarketAccounts,
+  bondVaultPda,
 } from "../sdk/client";
 
 const USDC = (n: number) => new BN(Math.round(n * 1_000_000));
@@ -1073,6 +1076,240 @@ describe("compute-markets", () => {
       );
       // The valid value set in `before` is unchanged after the failed calls.
       assert.strictEqual((await client.fetchConfig()).lpFeeBps, LP_FEE_BPS);
+    });
+  });
+
+  describe("optimistic-oracle resolver", () => {
+    const BOND = USDC(10);
+
+    before(async () => {
+      // `initialize` ran globally with bond_amount = 0; set a bond for this suite.
+      // Restored to 0 in `after` so the other suites (which never assert) are
+      // unaffected — the config is global.
+      await send([await client.setBondAmountIx(admin.publicKey, BOND)], admin);
+      assert.strictEqual((await client.fetchConfig()).bondAmount.toString(), BOND.toString());
+    });
+
+    after(async () => {
+      await send([await client.setBondAmountIx(admin.publicKey, new BN(0))], admin);
+      assert.strictEqual((await client.fetchConfig()).bondAmount.toString(), "0");
+    });
+
+    /** Create + seed an OPTIMISTIC binary market (resolverKind = 2). */
+    async function createOptimisticMarket(opts: {
+      resolutionOffset?: number;
+      closeOffset?: number;
+      seed?: BN;
+    }): Promise<number> {
+      const off = opts.resolutionOffset ?? 6;
+      const closeOff = opts.closeOffset ?? off;
+      const seed = opts.seed ?? USDC(1000);
+      const now = nowSec();
+      const { ix, marketId } = await client.createMarketIx(
+        admin.publicKey,
+        {
+          question: `Optimistic compute market #${Math.random()}`,
+          resolutionSource: "UMA-style optimistic oracle",
+          closeTime: new BN(now + closeOff),
+          resolutionTime: new BN(now + off),
+          // resolver may be default for an optimistic market.
+          resolver: PublicKey.default,
+          resolverKind: RESOLVER_OPTIMISTIC,
+        },
+        usdcMint
+      );
+      await send([ix], admin);
+      await send([await client.seedLiquidityIx(admin.publicKey, marketId, seed, usdcMint)], admin);
+      return marketId;
+    }
+
+    const bondVaultBalance = (marketId: number) =>
+      tokenBalance(bondVaultPda(deriveMarketAccounts(marketId).market)[0]);
+
+    it("happy path: undisputed assertion finalizes; asserter reclaims bond; conserves", async () => {
+      const marketId = await createOptimisticMarket({ resolutionOffset: 6, closeOffset: 6 });
+      const yesTokens = await buy(user1, marketId, OUTCOME_YES, USDC(200));
+      await buy(user2, marketId, OUTCOME_NO, USDC(50));
+      await assertConservation(marketId, "opt-happy-trade");
+
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+
+      // user1 asserts YES, posting the bond into the SEPARATE bond vault.
+      const u1usdc = getAssociatedTokenAddressSync(usdcMint, user1.publicKey);
+      const u1Before = await tokenBalance(u1usdc);
+      await send(await client.assertOutcomeIxs(user1.publicKey, marketId, OUTCOME_YES, usdcMint), user1);
+
+      const asserting = await client.fetchMarketById(marketId);
+      assert.strictEqual(asserting.state, STATE_RESOLVING);
+      assert.strictEqual(asserting.proposedOutcome, OUTCOME_YES);
+      assert.strictEqual(asserting.asserter.toBase58(), user1.publicKey.toBase58());
+      assert.strictEqual(asserting.bond.toString(), BOND.toString());
+      assert.isFalse(asserting.disputed);
+      // Bond debited from the asserter; escrowed in the bond vault.
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.sub(BOND).toString(), "bond debited");
+      assert.strictEqual((await bondVaultBalance(marketId)).toString(), BOND.toString(), "bond escrowed");
+      // The market collateral vault is untouched by the bond.
+      await assertConservation(marketId, "opt-happy-assert");
+
+      // Cannot finalize during the window.
+      assert.match(
+        await sendExpectFail([await client.finalizeAssertionIx(user1.publicKey, marketId, usdcMint)], user1),
+        /DisputeWindowOpen/
+      );
+
+      // After the window, finalize → bond refunded, market RESOLVED YES.
+      await waitChainTime(asserting.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeAssertionIx(user1.publicKey, marketId, usdcMint)], user1);
+      const fin = await client.fetchMarketById(marketId);
+      assert.strictEqual(fin.state, STATE_RESOLVED);
+      assert.strictEqual(fin.outcome, OUTCOME_YES);
+      assert.strictEqual(fin.bond.toString(), "0");
+
+      // Asserter's net USDC change across assert+finalize is ~0 (bond reclaimed).
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.toString(), "bond reclaimed net 0");
+      // Bond vault drained to 0.
+      assert.strictEqual((await bondVaultBalance(marketId)).toString(), "0", "bond vault drained");
+
+      // Winner redeems; collateral conservation still holds throughout.
+      await send([await client.redeemIx(user1.publicKey, marketId, OUTCOME_YES, yesTokens, usdcMint)], user1);
+      await assertConservation(marketId, "opt-happy-redeem");
+    });
+
+    it("disputed, asserter right: guardian awards 2x bond to the asserter", async () => {
+      const marketId = await createOptimisticMarket({ resolutionOffset: 5, closeOffset: 5 });
+      await buy(user1, marketId, OUTCOME_YES, USDC(100));
+
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+
+      const u1usdc = getAssociatedTokenAddressSync(usdcMint, user1.publicKey);
+      const u2usdc = getAssociatedTokenAddressSync(usdcMint, user2.publicKey);
+      const u1Before = await tokenBalance(u1usdc);
+      const u2Before = await tokenBalance(u2usdc);
+
+      // user1 asserts YES; user2 disputes (each posts a bond).
+      await send(await client.assertOutcomeIxs(user1.publicKey, marketId, OUTCOME_YES, usdcMint), user1);
+      await send([await client.disputeAssertionIx(user2.publicKey, marketId, usdcMint)], user2);
+      const disputed = await client.fetchMarketById(marketId);
+      assert.isTrue(disputed.disputed);
+      assert.strictEqual(disputed.disputer.toBase58(), user2.publicKey.toBase58());
+      assert.strictEqual((await bondVaultBalance(marketId)).toString(), BOND.muln(2).toString(), "2x bond escrowed");
+
+      // Guardian rules YES correct → asserter (user1) wins the 2x bond.
+      await send(
+        [await client.resolveDisputeIx(guardian.publicKey, marketId, OUTCOME_YES, user1.publicKey, usdcMint)],
+        guardian
+      );
+      const resolved = await client.fetchMarketById(marketId);
+      assert.strictEqual(resolved.state, STATE_RESOLVED);
+      assert.strictEqual(resolved.outcome, OUTCOME_YES);
+      assert.strictEqual(resolved.bond.toString(), "0");
+
+      // Bond P&L: asserter +BOND (won the disputer's bond back plus their own),
+      // disputer −BOND. Bond vault drains to 0.
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.add(BOND).toString(), "asserter +bond");
+      assert.strictEqual((await tokenBalance(u2usdc)).toString(), u2Before.sub(BOND).toString(), "disputer -bond");
+      assert.strictEqual((await bondVaultBalance(marketId)).toString(), "0", "bond vault drained");
+      await assertConservation(marketId, "opt-dispute-right");
+    });
+
+    it("disputed, asserter wrong: guardian awards 2x bond to the disputer", async () => {
+      const marketId = await createOptimisticMarket({ resolutionOffset: 5, closeOffset: 5 });
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+
+      const u1usdc = getAssociatedTokenAddressSync(usdcMint, user1.publicKey);
+      const u2usdc = getAssociatedTokenAddressSync(usdcMint, user2.publicKey);
+      const u1Before = await tokenBalance(u1usdc);
+      const u2Before = await tokenBalance(u2usdc);
+
+      // user1 asserts YES; user2 disputes.
+      await send(await client.assertOutcomeIxs(user1.publicKey, marketId, OUTCOME_YES, usdcMint), user1);
+      await send([await client.disputeAssertionIx(user2.publicKey, marketId, usdcMint)], user2);
+
+      // Guardian rules NO correct → disputer (user2) wins the 2x bond.
+      await send(
+        [await client.resolveDisputeIx(guardian.publicKey, marketId, OUTCOME_NO, user2.publicKey, usdcMint)],
+        guardian
+      );
+      const resolved = await client.fetchMarketById(marketId);
+      assert.strictEqual(resolved.state, STATE_RESOLVED);
+      assert.strictEqual(resolved.outcome, OUTCOME_NO);
+
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.sub(BOND).toString(), "asserter -bond");
+      assert.strictEqual((await tokenBalance(u2usdc)).toString(), u2Before.add(BOND).toString(), "disputer +bond");
+      assert.strictEqual((await bondVaultBalance(marketId)).toString(), "0", "bond vault drained");
+      await assertConservation(marketId, "opt-dispute-wrong");
+    });
+
+    it("negative cases", async () => {
+      // (a) assert before resolution_time → TooEarlyToResolve.
+      const early = await createOptimisticMarket({ resolutionOffset: 30, closeOffset: 30 });
+      assert.match(
+        await sendExpectFail(await client.assertOutcomeIxs(user1.publicKey, early, OUTCOME_YES, usdcMint), user1),
+        /TooEarlyToResolve/
+      );
+
+      // (b) assert on a trusted-key market → WrongResolverKind.
+      const trusted = await createSeededMarket({ resolutionOffset: 4, closeOffset: 4 });
+      const tm = await client.fetchMarketById(trusted);
+      await waitChainTime(tm.resolutionTime.toNumber() + 1);
+      assert.match(
+        await sendExpectFail(await client.assertOutcomeIxs(user1.publicKey, trusted, OUTCOME_YES, usdcMint), user1),
+        /WrongResolverKind/
+      );
+
+      // (c) dispute_void on an optimistic market → WrongResolverKind.
+      const opt = await createOptimisticMarket({ resolutionOffset: 5, closeOffset: 5 });
+      const om = await client.fetchMarketById(opt);
+      await waitChainTime(om.resolutionTime.toNumber() + 1);
+      await send(await client.assertOutcomeIxs(user1.publicKey, opt, OUTCOME_YES, usdcMint), user1);
+      assert.match(
+        await sendExpectFail([await client.disputeVoidIx(guardian.publicKey, opt)], guardian),
+        /WrongResolverKind/
+      );
+
+      // (d) self-dispute (asserter disputes their own assertion) → SelfDispute.
+      assert.match(
+        await sendExpectFail([await client.disputeAssertionIx(user1.publicKey, opt, usdcMint)], user1),
+        /SelfDispute/
+      );
+
+      // (e) finalize a disputed assertion → DisputeUnresolved.
+      await send([await client.disputeAssertionIx(user2.publicKey, opt, usdcMint)], user2);
+      assert.match(
+        await sendExpectFail([await client.finalizeAssertionIx(user1.publicKey, opt, usdcMint)], user1),
+        /DisputeUnresolved/
+      );
+
+      // (f) resolve_dispute by a non-guardian → Unauthorized.
+      assert.match(
+        await sendExpectFail(
+          [await client.resolveDisputeIx(user1.publicKey, opt, OUTCOME_YES, user1.publicKey, usdcMint)],
+          user1
+        ),
+        /Unauthorized/
+      );
+
+      // (g) dispute after the window closes → DisputeWindowClosed.
+      const late = await createOptimisticMarket({ resolutionOffset: 4, closeOffset: 4 });
+      const lm = await client.fetchMarketById(late);
+      await waitChainTime(lm.resolutionTime.toNumber() + 1);
+      await send(await client.assertOutcomeIxs(user1.publicKey, late, OUTCOME_YES, usdcMint), user1);
+      const asserted = await client.fetchMarketById(late);
+      await waitChainTime(asserted.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      assert.match(
+        await sendExpectFail([await client.disputeAssertionIx(user2.publicKey, late, usdcMint)], user2),
+        /DisputeWindowClosed/
+      );
+      // The undisputed assertion still finalizes fine after the window.
+      await send([await client.finalizeAssertionIx(user1.publicKey, late, usdcMint)], user1);
+      assert.strictEqual((await client.fetchMarketById(late)).state, STATE_RESOLVED);
+
+      // void_stale still works on an un-asserted optimistic market (state OPEN).
+      const stale = await createOptimisticMarket({ resolutionOffset: 4, closeOffset: 4 });
+      assert.strictEqual((await client.fetchMarketById(stale)).state, STATE_OPEN);
     });
   });
 });

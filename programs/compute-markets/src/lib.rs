@@ -73,6 +73,14 @@ pub const RESOLVER_TRUSTED_KEY: u8 = 0;
 /// [`PriceFeed`] (the bridge target for a Switchboard On-Demand Function or a
 /// committee multisig) by comparing its value to the market's strike.
 pub const RESOLVER_ORACLE_FEED: u8 = 1;
+/// Optimistic-oracle resolver (UMA-style): ANYONE may `assert_outcome` by posting
+/// a bond; ANYONE may `dispute_assertion` with an equal bond. An undisputed
+/// assertion `finalize_assertion`s after the dispute window (the asserter reclaims
+/// their bond); a disputed one is settled by the guardian via `resolve_dispute`,
+/// who awards both bonds to whoever asserted the correct outcome. Bonds live in a
+/// SEPARATE bond vault so the market collateral vault (and its conservation
+/// invariant) is never touched. BINARY markets only.
+pub const RESOLVER_OPTIMISTIC: u8 = 2;
 
 /// Maximum protocol fee (10%).
 pub const MAX_FEE_BPS: u16 = 1_000;
@@ -92,6 +100,10 @@ pub const POOL_YES_SEED: &[u8] = b"pool_yes";
 pub const POOL_NO_SEED: &[u8] = b"pool_no";
 /// Per-provider liquidity-position PDA seed: `[LP_SEED, market, owner]`.
 pub const LP_SEED: &[u8] = b"lp";
+/// Bond-vault PDA seed: `[BOND_SEED, market]`. A token account (collateral mint,
+/// authority = market) that escrows optimistic-resolver assert/dispute bonds,
+/// kept strictly separate from the market collateral vault.
+pub const BOND_SEED: &[u8] = b"bond";
 
 /// One side of a binary market. Centralizes the YES/NO ↔ reserve mapping so the
 /// trade handlers never hand-mirror branches (a transposed branch would be a
@@ -123,12 +135,15 @@ pub mod compute_markets {
     ///   (0..=10_000; 10_000 = the entire fee to LPs).
     /// * `dispute_period` — seconds between a proposed outcome and payout unlock.
     /// * `guardian` — key allowed to pause and to veto a proposed outcome.
+    /// * `bond_amount` — the bond required to `assert_outcome` / `dispute_assertion`
+    ///   on an optimistic-resolver market (0 disables optimistic assertions).
     pub fn initialize(
         ctx: Context<Initialize>,
         fee_bps: u16,
         lp_fee_bps: u16,
         dispute_period: i64,
         guardian: Pubkey,
+        bond_amount: u64,
     ) -> Result<()> {
         require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
         require!(
@@ -149,6 +164,7 @@ pub mod compute_markets {
         config.dispute_period = dispute_period;
         config.market_count = 0;
         config.paused = false;
+        config.bond_amount = bond_amount;
         config.bump = ctx.bumps.config;
         Ok(())
     }
@@ -195,6 +211,10 @@ pub mod compute_markets {
                     math::oracle_is_yes(0, 0, oracle_comparison).is_some(),
                     ErrorCode::InvalidComparison
                 );
+            }
+            RESOLVER_OPTIMISTIC => {
+                // No oracle/strike/resolver validation: the asserter is permissionless
+                // and posts a bond at `assert_outcome` time. `resolver` may be default.
             }
             _ => return err!(ErrorCode::UnsupportedResolverKind),
         }
@@ -248,6 +268,10 @@ pub mod compute_markets {
         market.state = STATE_OPEN;
         market.outcome = 0;
         market.proposed_outcome = 0;
+        market.asserter = Pubkey::default();
+        market.disputer = Pubkey::default();
+        market.bond = 0;
+        market.disputed = false;
         market.close_time = close_time;
         market.resolution_time = resolution_time;
         market.resolved_at = 0;
@@ -1134,6 +1158,237 @@ pub mod compute_markets {
         Ok(())
     }
 
+    /// Optimistic resolution, step 1 (PERMISSIONLESS): anyone asserts a binary
+    /// outcome by posting `config.bond_amount` collateral into the SEPARATE bond
+    /// vault. Opens the dispute window; the assertion either finalizes undisputed
+    /// (`finalize_assertion`, asserter reclaims the bond) or is disputed
+    /// (`dispute_assertion`) and settled by the guardian (`resolve_dispute`).
+    pub fn assert_outcome(ctx: Context<AssertOutcome>, outcome: u8) -> Result<()> {
+        let _ = Side::from_u8(outcome)?;
+        let bond_amount = ctx.accounts.config.bond_amount;
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.resolver_kind == RESOLVER_OPTIMISTIC,
+            ErrorCode::WrongResolverKind
+        );
+        require!(
+            market.market_kind == MARKET_BINARY,
+            ErrorCode::WrongMarketKind
+        );
+        require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= market.resolution_time, ErrorCode::TooEarlyToResolve);
+        require!(bond_amount > 0, ErrorCode::NoBondConfigured);
+
+        // Escrow the bond in the bond vault (NOT the market collateral vault).
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.asserter_collateral.to_account_info(),
+                    to: ctx.accounts.bond_vault.to_account_info(),
+                    authority: ctx.accounts.asserter.to_account_info(),
+                },
+            ),
+            bond_amount,
+        )?;
+
+        market.state = STATE_RESOLVING;
+        market.proposed_outcome = outcome;
+        market.asserter = ctx.accounts.asserter.key();
+        market.disputer = Pubkey::default();
+        market.bond = bond_amount;
+        market.disputed = false;
+        market.resolved_at = now;
+
+        emit!(OutcomeAsserted {
+            market: market.key(),
+            asserter: ctx.accounts.asserter.key(),
+            outcome,
+            bond: bond_amount,
+            asserted_at: now,
+        });
+        Ok(())
+    }
+
+    /// Optimistic resolution, step 2a (PERMISSIONLESS): challenge an open assertion
+    /// by posting an equal bond into the bond vault, within the dispute window. A
+    /// disputed assertion can no longer finalize on its own — only the guardian's
+    /// `resolve_dispute` settles it (awarding both bonds to the correct asserter).
+    pub fn dispute_assertion(ctx: Context<DisputeAssertion>) -> Result<()> {
+        let dispute_period = ctx.accounts.config.dispute_period;
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.resolver_kind == RESOLVER_OPTIMISTIC,
+            ErrorCode::WrongResolverKind
+        );
+        require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
+        require!(!market.disputed, ErrorCode::AlreadyDisputed);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now < market
+                .resolved_at
+                .checked_add(dispute_period)
+                .ok_or(ErrorCode::MathOverflow)?,
+            ErrorCode::DisputeWindowClosed
+        );
+        require!(
+            ctx.accounts.disputer.key() != market.asserter,
+            ErrorCode::SelfDispute
+        );
+
+        // Post the matching bond into the bond vault.
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.disputer_collateral.to_account_info(),
+                    to: ctx.accounts.bond_vault.to_account_info(),
+                    authority: ctx.accounts.disputer.to_account_info(),
+                },
+            ),
+            market.bond,
+        )?;
+
+        market.disputer = ctx.accounts.disputer.key();
+        market.disputed = true;
+
+        emit!(AssertionDisputed {
+            market: market.key(),
+            disputer: ctx.accounts.disputer.key(),
+        });
+        Ok(())
+    }
+
+    /// Optimistic resolution, step 2b (PERMISSIONLESS): finalize an UNDISPUTED
+    /// assertion once the dispute window has elapsed. Refunds the asserter's bond
+    /// from the bond vault (PDA-signed) and resolves the market to the asserted
+    /// outcome. Disputed assertions must go through `resolve_dispute` instead.
+    pub fn finalize_assertion(ctx: Context<FinalizeAssertion>) -> Result<()> {
+        let dispute_period = ctx.accounts.config.dispute_period;
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.resolver_kind == RESOLVER_OPTIMISTIC,
+            ErrorCode::WrongResolverKind
+        );
+        require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
+        // A disputed assertion cannot finalize itself — only the guardian settles it.
+        require!(!market.disputed, ErrorCode::DisputeUnresolved);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= market
+                .resolved_at
+                .checked_add(dispute_period)
+                .ok_or(ErrorCode::MathOverflow)?,
+            ErrorCode::DisputeWindowOpen
+        );
+        require!(
+            ctx.accounts.asserter.key() == market.asserter,
+            ErrorCode::Unauthorized
+        );
+
+        // Refund the asserter's bond from the bond vault (PDA-signed).
+        let bond = market.bond;
+        let id_bytes = market.market_id.to_le_bytes();
+        let bump_seed = [market.bump];
+        let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
+        let signer: &[&[&[u8]]] = &[seeds];
+        if bond > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.bond_vault.to_account_info(),
+                        to: ctx.accounts.asserter_collateral.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                bond,
+            )?;
+        }
+        market.bond = 0;
+        market.state = STATE_RESOLVED;
+        market.outcome = market.proposed_outcome;
+
+        emit!(MarketResolved {
+            market: market.key(),
+            outcome: market.outcome,
+            settlement_fraction: market.settlement_fraction,
+            resolved_at: now,
+        });
+        Ok(())
+    }
+
+    /// Optimistic resolution, step 2c (GUARDIAN only): settle a DISPUTED assertion.
+    /// The guardian (the DVM / council stand-in) declares the `correct_outcome`;
+    /// the whole `2 * bond` escrow goes to whoever asserted it (the asserter if
+    /// `proposed_outcome == correct_outcome`, else the disputer), PDA-signed out of
+    /// the bond vault. The market resolves to `correct_outcome`.
+    pub fn resolve_dispute(ctx: Context<ResolveDispute>, correct_outcome: u8) -> Result<()> {
+        let _ = Side::from_u8(correct_outcome)?;
+        require!(
+            ctx.accounts.guardian.key() == ctx.accounts.config.guardian,
+            ErrorCode::Unauthorized
+        );
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.resolver_kind == RESOLVER_OPTIMISTIC,
+            ErrorCode::WrongResolverKind
+        );
+        require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
+        require!(market.disputed, ErrorCode::DisputeUnresolved);
+
+        // The winner is whoever asserted the side the guardian ruled correct.
+        let asserter_correct = market.proposed_outcome == correct_outcome;
+        let winner = if asserter_correct {
+            market.asserter
+        } else {
+            market.disputer
+        };
+        require_keys_eq!(
+            ctx.accounts.winner_collateral.owner,
+            winner,
+            ErrorCode::WrongOwner
+        );
+        require_keys_eq!(
+            ctx.accounts.winner_collateral.mint,
+            market.collateral_mint,
+            ErrorCode::WrongMint
+        );
+
+        // Pay out the full 2*bond escrow to the winner (PDA-signed).
+        let payout = market.bond.checked_mul(2).ok_or(ErrorCode::MathOverflow)?;
+        let id_bytes = market.market_id.to_le_bytes();
+        let bump_seed = [market.bump];
+        let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
+        let signer: &[&[&[u8]]] = &[seeds];
+        if payout > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.bond_vault.to_account_info(),
+                        to: ctx.accounts.winner_collateral.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                payout,
+            )?;
+        }
+        market.bond = 0;
+        market.state = STATE_RESOLVED;
+        market.outcome = correct_outcome;
+
+        emit!(DisputeResolved {
+            market: market.key(),
+            outcome: correct_outcome,
+            winner,
+        });
+        Ok(())
+    }
+
     /// Step 2 of resolution: finalize a proposed outcome once the dispute window
     /// has elapsed. Permissionless — anyone may crank it.
     pub fn finalize_outcome(ctx: Context<FinalizeOutcome>) -> Result<()> {
@@ -1185,6 +1440,12 @@ pub mod compute_markets {
         );
         let dispute_period = ctx.accounts.config.dispute_period;
         let market = &mut ctx.accounts.market;
+        // Optimistic markets settle disputes via `resolve_dispute` (bond-weighted),
+        // not the guardian 50/50 void path — keep the two flows from crossing.
+        require!(
+            market.resolver_kind != RESOLVER_OPTIMISTIC,
+            ErrorCode::WrongResolverKind
+        );
         require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
         let now = Clock::get()?.unix_timestamp;
         require!(
@@ -1658,6 +1919,17 @@ pub mod compute_markets {
         Ok(())
     }
 
+    /// Update the optimistic-resolver bond (admin only). No bound beyond type; 0
+    /// disables `assert_outcome`.
+    pub fn set_bond_amount(ctx: Context<AdminOnly>, value: u64) -> Result<()> {
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.config.admin,
+            ErrorCode::Unauthorized
+        );
+        ctx.accounts.config.bond_amount = value;
+        Ok(())
+    }
+
     /// Update the guardian (admin only).
     pub fn set_guardian(ctx: Context<AdminOnly>, guardian: Pubkey) -> Result<()> {
         require!(
@@ -1706,13 +1978,16 @@ pub struct Config {
     pub dispute_period: i64,
     pub market_count: u64,
     pub paused: bool,
+    /// Bond required to `assert_outcome` / `dispute_assertion` on an optimistic
+    /// market (0 disables optimistic assertions). Settable via `set_bond_amount`.
+    pub bond_amount: u64,
     pub bump: u8,
 }
 
 impl Config {
     // 8 disc + 4*32 keys + 2 fee_bps + 2 lp_fee_bps + 8 dispute_period
-    //   + 8 market_count + 1 paused + 1 bump.
-    pub const SPACE: usize = 8 + 32 + 32 + 32 + 32 + 2 + 2 + 8 + 8 + 1 + 1;
+    //   + 8 market_count + 1 paused + 8 bond_amount + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 32 + 32 + 32 + 2 + 2 + 8 + 8 + 1 + 8 + 1;
 }
 
 #[account]
@@ -1760,6 +2035,14 @@ pub struct Market {
     pub state: u8,
     pub outcome: u8,
     pub proposed_outcome: u8,
+    /// Optimistic resolver (`RESOLVER_OPTIMISTIC`) bookkeeping. `asserter` posted
+    /// the open assertion's bond; `disputer` (if any) posted the matching bond;
+    /// `bond` is the per-side bond escrowed in the bond vault (0 once settled);
+    /// `disputed` flags that the assertion is contested (→ `resolve_dispute`).
+    pub asserter: Pubkey,
+    pub disputer: Pubkey,
+    pub bond: u64,
+    pub disputed: bool,
     pub close_time: i64,
     pub resolution_time: i64,
     pub resolved_at: i64,
@@ -1803,6 +2086,10 @@ impl Market {
         + 1  // state
         + 1  // outcome
         + 1  // proposed_outcome
+        + 32 // asserter
+        + 32 // disputer
+        + 8  // bond
+        + 1  // disputed
         + 8  // close_time
         + 8  // resolution_time
         + 8  // resolved_at
@@ -2135,6 +2422,104 @@ pub struct ProposeFromOracle<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AssertOutcome<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(address = market.collateral_mint)]
+    pub collateral_mint: Box<Account<'info, Mint>>,
+
+    /// The bond escrow, created on first assert. SEPARATE from `market.vault`, so
+    /// bonds never touch the collateral-conservation invariant.
+    #[account(
+        init_if_needed,
+        payer = asserter,
+        seeds = [BOND_SEED, market.key().as_ref()],
+        bump,
+        token::mint = collateral_mint,
+        token::authority = market,
+    )]
+    pub bond_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = asserter_collateral.mint == market.collateral_mint @ ErrorCode::WrongMint,
+        constraint = asserter_collateral.owner == asserter.key() @ ErrorCode::WrongOwner,
+    )]
+    pub asserter_collateral: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub asserter: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct DisputeAssertion<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(mut, seeds = [BOND_SEED, market.key().as_ref()], bump)]
+    pub bond_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = disputer_collateral.mint == market.collateral_mint @ ErrorCode::WrongMint,
+        constraint = disputer_collateral.owner == disputer.key() @ ErrorCode::WrongOwner,
+    )]
+    pub disputer_collateral: Box<Account<'info, TokenAccount>>,
+
+    pub disputer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeAssertion<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(mut, seeds = [BOND_SEED, market.key().as_ref()], bump)]
+    pub bond_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = asserter_collateral.mint == market.collateral_mint @ ErrorCode::WrongMint,
+        constraint = asserter_collateral.owner == market.asserter @ ErrorCode::WrongOwner,
+    )]
+    pub asserter_collateral: Box<Account<'info, TokenAccount>>,
+
+    /// The original asserter (must match `market.asserter`); reclaims the bond.
+    pub asserter: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ResolveDispute<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [MARKET_SEED, market.market_id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(mut, seeds = [BOND_SEED, market.key().as_ref()], bump)]
+    pub bond_vault: Box<Account<'info, TokenAccount>>,
+
+    /// The winner's collateral ATA — its owner/mint are checked in the handler
+    /// against the guardian's ruling (asserter or disputer).
+    #[account(mut)]
+    pub winner_collateral: Box<Account<'info, TokenAccount>>,
+
+    pub guardian: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct FinalizeOutcome<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
@@ -2300,6 +2685,28 @@ pub struct MarketResolved {
 }
 
 #[event]
+pub struct OutcomeAsserted {
+    pub market: Pubkey,
+    pub asserter: Pubkey,
+    pub outcome: u8,
+    pub bond: u64,
+    pub asserted_at: i64,
+}
+
+#[event]
+pub struct AssertionDisputed {
+    pub market: Pubkey,
+    pub disputer: Pubkey,
+}
+
+#[event]
+pub struct DisputeResolved {
+    pub market: Pubkey,
+    pub outcome: u8,
+    pub winner: Pubkey,
+}
+
+#[event]
 pub struct ScalarProposed {
     pub market: Pubkey,
     pub resolver: Pubkey,
@@ -2442,6 +2849,14 @@ pub enum ErrorCode {
     FeedHasNoValue,
     #[msg("Price feed value is too stale to resolve")]
     StaleFeed,
+    #[msg("No bond is configured for optimistic assertions")]
+    NoBondConfigured,
+    #[msg("Assertion has already been disputed")]
+    AlreadyDisputed,
+    #[msg("Cannot dispute your own assertion")]
+    SelfDispute,
+    #[msg("Disputed assertion must be settled by the guardian")]
+    DisputeUnresolved,
     #[msg("Arithmetic overflow")]
     MathOverflow,
 }

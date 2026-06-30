@@ -21,6 +21,8 @@ export const STATE_VOID = 3;
 /** Resolver kinds. */
 export const RESOLVER_TRUSTED_KEY = 0;
 export const RESOLVER_ORACLE_FEED = 1;
+/** Optimistic (UMA-style bonded assert + dispute) resolver; BINARY markets only. */
+export const RESOLVER_OPTIMISTIC = 2;
 
 /** Market kinds: binary YES/NO vs scalar/range (YES=LONG, NO=SHORT). */
 export const MARKET_BINARY = 0;
@@ -89,6 +91,11 @@ export function liquidityPositionPda(
     [enc("lp"), market.toBuffer(), owner.toBuffer()],
     programId
   );
+}
+
+/** Bond-vault token-account PDA for an optimistic market: seeds `["bond", market]`. */
+export function bondVaultPda(market: PublicKey, programId: PublicKey = PROGRAM_ID) {
+  return PublicKey.findProgramAddressSync([enc("bond"), market.toBuffer()], programId);
 }
 
 /** Bundle of every PDA tied to a market id. */
