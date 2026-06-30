@@ -36,6 +36,7 @@ import {
 import {
   ComputeClient,
   OUTCOME_YES,
+  OUTCOME_NO,
   MARKET_BINARY,
   MARKET_SCALAR,
   RESOLVER_TRUSTED_KEY,
@@ -121,8 +122,19 @@ async function main() {
   const t = nowSec();
   const farClose = new BN(t + 7 * DAY);
 
+  // A price-moving buy: admin trades against a freshly-seeded pool so the demo
+  // markets show realistic, varied odds instead of a flat 50/50.
+  const { quoteBuy } = await import("../sdk/amm");
+  async function move(marketId: number, outcome: number, amount: BN) {
+    const m = await client.fetchMarketById(marketId);
+    const net = amount.sub(amount.muln(100).divn(10000)); // net of the 1% taker fee
+    const [rb, ro] = outcome === OUTCOME_YES ? [m.reserveYes, m.reserveNo] : [m.reserveNo, m.reserveYes];
+    const q = quoteBuy(rb, ro, net);
+    await send(await client.buyIxs(admin.publicKey, marketId, outcome, amount, q.tokensOut, usdcMint));
+  }
+
   // 1) Binary, trusted-key resolver.
-  await makeMarket("Binary · trusted · 'H100 neocloud < $2.00/hr by month end?'", {
+  const m0 = await makeMarket("Binary · trusted · 'H100 neocloud < $2.00/hr by month end?'", {
     question: "Will the H100 neocloud rate settle below $2.00/hr at month end?",
     resolutionSource: "Silicon Data SDH100RT",
     closeTime: farClose,
@@ -130,10 +142,10 @@ async function main() {
     resolver: admin.publicKey,
     resolverKind: RESOLVER_TRUSTED_KEY,
     marketKind: MARKET_BINARY,
-  });
+  }, USDC(6000));
 
   // 2) Scalar / range, trusted-key resolver. Range $1.50–$3.50 (stored *100).
-  await makeMarket("Scalar · trusted · 'H100 neocloud $/hr, range $1.50–$3.50'", {
+  const m1 = await makeMarket("Scalar · trusted · 'H100 neocloud $/hr, range $1.50–$3.50'", {
     question: "H100 neocloud $/hr monthly settlement (scalar)",
     resolutionSource: "Silicon Data SDH100RT",
     closeTime: farClose,
@@ -143,14 +155,14 @@ async function main() {
     marketKind: MARKET_SCALAR,
     lowerBound: new BN(150),
     upperBound: new BN(350),
-  });
+  }, USDC(9000));
 
   // 3) Binary, oracle-feed resolver, with a published PriceFeed.
   const feed = Keypair.generate();
   await send([await client.initPriceFeedIx(admin.publicKey, feed.publicKey, "OCPI ORNNH100", 2)], [feed]);
   await send([await client.publishPriceIx(admin.publicKey, feed.publicKey, new BN(243))]); // $2.43
   console.log(`Price feed        ${feed.publicKey.toBase58()}  (OCPI ORNNH100 = $2.43, decimals 2)`);
-  await makeMarket("Binary · oracle-feed · 'H100 >= $2.20/hr?' (feed=$2.43)", {
+  const m2 = await makeMarket("Binary · oracle-feed · 'H100 >= $2.20/hr?' (feed=$2.43)", {
     question: "Will the H100 OCPI index settle at or above $2.20/hr?",
     resolutionSource: "OCPI ORNNH100",
     closeTime: farClose,
@@ -161,10 +173,10 @@ async function main() {
     oracleStrike: new BN(220),
     oracleComparison: CMP_GTE,
     oracleMaxStaleness: new BN(7 * DAY),
-  });
+  }, USDC(14000));
 
   // 4) Binary, optimistic resolver.
-  await makeMarket("Binary · optimistic · 'New frontier model ships this quarter?'", {
+  const m3 = await makeMarket("Binary · optimistic · 'New frontier model ships this quarter?'", {
     question: "Will a new frontier model (>= GPT-5 class) ship this quarter?",
     resolutionSource: "Public announcements / LMArena",
     closeTime: farClose,
@@ -172,17 +184,23 @@ async function main() {
     resolver: admin.publicKey, // unused for optimistic
     resolverKind: RESOLVER_OPTIMISTIC,
     marketKind: MARKET_BINARY,
-  });
+  }, USDC(4000));
 
-  // ----- a sample trade so the markets look alive -----
-  const firstId = created[0].id;
-  const m = await client.fetchMarketById(firstId);
-  const a = USDC(150).sub(USDC(150).muln(100).divn(10000));
-  // quote YES
-  const { quoteBuy } = await import("../sdk/amm");
-  const q = quoteBuy(m.reserveYes, m.reserveNo, a);
-  await send(await client.buyIxs(admin.publicKey, firstId, OUTCOME_YES, USDC(150), q.tokensOut, usdcMint));
-  console.log(`Sample trade      admin bought YES on market #${firstId}`);
+  // ----- realistic order flow so prices aren't a flat 50/50 -----
+  console.log("Placing demo trades ...");
+  // #0: most don't expect H100 to fall below $2.00 -> leans NO.
+  await move(m0, OUTCOME_NO, USDC(2600));
+  await move(m0, OUTCOME_YES, USDC(700));
+  // #1 scalar: net LONG demand pushes the implied $/hr up.
+  await move(m1, OUTCOME_YES, USDC(3200));
+  await move(m1, OUTCOME_NO, USDC(900));
+  // #2 oracle: the feed ($2.43) already clears the $2.20 strike -> strong YES.
+  await move(m2, OUTCOME_YES, USDC(7000));
+  await move(m2, OUTCOME_NO, USDC(800));
+  // #3 optimistic: a mild YES lean.
+  await move(m3, OUTCOME_YES, USDC(1500));
+  await move(m3, OUTCOME_NO, USDC(450));
+  console.log("Demo trades placed.");
 
   console.log("\n=== demo ready ===");
   console.log(`collateral mint : ${usdcMint.toBase58()}`);

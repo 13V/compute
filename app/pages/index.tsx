@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import BN from "bn.js";
 import TopBar from "../components/TopBar";
+import { RPC_URL } from "../components/WalletProviders";
 import { useReadClient } from "../components/useComputeClient";
 import { useNow, marketStateLabel, StateBadge } from "../components/ui";
 import type { MarketEntry } from "../components/types";
@@ -16,6 +18,7 @@ import {
   formatPct,
   formatAbsTime,
   formatRelTime,
+  clusterFromRpc,
 } from "../lib/format";
 import { STATE_RESOLVED, STATE_VOID, OUTCOME_YES } from "../lib/pdas";
 import { marginalPrice as marginal } from "../lib/amm";
@@ -27,6 +30,61 @@ import {
 function fmtNum(n: number): string {
   // Trim to at most 2 decimals, drop trailing zeros.
   return Number.isFinite(n) ? parseFloat(n.toFixed(2)).toString() : "—";
+}
+
+/** Compact human number for stat chips: 1234 -> "1.2K". */
+function fmtCompact(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n >= 1_000_000) return `${parseFloat((n / 1_000_000).toFixed(1))}M`;
+  if (n >= 1_000) return `${parseFloat((n / 1_000).toFixed(1))}K`;
+  return parseFloat(n.toFixed(2)).toString();
+}
+
+/**
+ * A Polymarket-style split probability bar. `long`/`short` are 0..1 prices;
+ * guarded against NaN / non-positive sums (falls back to 50/50).
+ */
+export function ProbBar({
+  long,
+  short,
+  yesLabel,
+  noLabel,
+}: {
+  long: number;
+  short: number;
+  yesLabel: string;
+  noLabel: string;
+}) {
+  const l = Number.isFinite(long) && long > 0 ? long : 0;
+  const s = Number.isFinite(short) && short > 0 ? short : 0;
+  const sum = l + s;
+  const longFrac = sum > 0 ? l / sum : 0.5;
+  const pct = Math.max(0, Math.min(100, longFrac * 100));
+  return (
+    <div className="probbar">
+      <div className="probbar-head">
+        <span className="probbar-side yes">
+          <span className="lab">{yesLabel}</span>
+          <span className="pct">{formatPct(long)}</span>
+        </span>
+        <span className="probbar-side no">
+          <span className="lab">{noLabel}</span>
+          <span className="pct">{formatPct(short)}</span>
+        </span>
+      </div>
+      <div
+        className="probbar-track"
+        style={{ ["--split" as any]: `${pct}%` }}
+        role="img"
+        aria-label={`${yesLabel} ${formatPct(long)}, ${noLabel} ${formatPct(
+          short
+        )}`}
+      >
+        <div className="probbar-fill yes" style={{ width: `${pct}%` }} />
+        <div className="probbar-fill no" style={{ width: `${100 - pct}%` }} />
+      </div>
+    </div>
+  );
 }
 
 export default function Home() {
@@ -56,9 +114,48 @@ export default function Home() {
     load();
   }, [load]);
 
+  const cluster = clusterFromRpc(RPC_URL);
+  // Hero stats derived from already-loaded data.
+  const marketCount = markets?.length ?? 0;
+  const totalTvl = (markets ?? []).reduce(
+    (acc, m) => acc.add(m.account.collateral),
+    new BN(0)
+  );
+  const tvlNum = parseFloat(formatUnits(totalTvl));
+
   return (
     <div className="container">
       <TopBar />
+
+      <section className="hero">
+        <div className="hero-content">
+          <span className="eyebrow">
+            <span className="dot" /> Live on {cluster}
+          </span>
+          <h1>
+            Trade on the price of <span className="grad">compute</span>.
+          </h1>
+          <p className="sub">
+            On-chain prediction markets for GPU rental rates, compute costs, and
+            AI milestones. Take a position on where the future of compute is
+            headed — settled trustlessly on Solana.
+          </p>
+        </div>
+        <div className="hero-stats">
+          <span className="stat-chip">
+            <span className="num tnum">{marketCount}</span>
+            <span className="lab">{marketCount === 1 ? "market" : "markets"}</span>
+          </span>
+          <span className="stat-chip">
+            <span className="num tnum">{fmtCompact(tvlNum)}</span>
+            <span className="lab">USDC TVL</span>
+          </span>
+          <span className="stat-chip live">
+            <span className="num">●</span>
+            <span className="lab">{cluster}</span>
+          </span>
+        </div>
+      </section>
 
       <div className="flex-between" style={{ marginBottom: 14 }}>
         <h2 style={{ margin: 0 }}>Markets</h2>
@@ -78,8 +175,26 @@ export default function Home() {
       )}
 
       {!error && markets && markets.length === 0 && !loading && (
-        <div className="notice info">
-          No markets found on this cluster yet.
+        <div className="empty">
+          <div className="icon" aria-hidden="true">◎</div>
+          <div className="title">No markets yet</div>
+          <div className="desc">
+            No markets have been created on this cluster. Check back soon.
+          </div>
+        </div>
+      )}
+
+      {loading && !markets && (
+        <div className="skel-grid" aria-hidden="true">
+          {[0, 1, 2].map((i) => (
+            <div className="skel-card" key={i}>
+              <div className="skel line" style={{ width: "70%" }} />
+              <div className="skel line" style={{ width: "40%" }} />
+              <div className="skel bar" />
+              <div className="skel line" style={{ width: "55%" }} />
+              <div className="skel line" style={{ width: "50%", marginBottom: 0 }} />
+            </div>
+          ))}
         </div>
       )}
 
@@ -103,7 +218,7 @@ export default function Home() {
               className="card market-card"
             >
               <div className="flex-between">
-                <strong style={{ fontSize: 16 }}>{a.question}</strong>
+                <span className="q">{a.question}</span>
                 <StateBadge label={label} />
               </div>
               <div className="kindrow" style={{ marginTop: 6 }}>
@@ -127,16 +242,12 @@ export default function Home() {
 
               {scalar ? (
                 <>
-                  <div className="prices">
-                    <div className="price-pill yes">
-                      <div className="lab">LONG</div>
-                      <div className="val">{formatPct(longPrice)}</div>
-                    </div>
-                    <div className="price-pill no">
-                      <div className="lab">SHORT</div>
-                      <div className="val">{formatPct(shortPrice)}</div>
-                    </div>
-                  </div>
+                  <ProbBar
+                    long={longPrice}
+                    short={shortPrice}
+                    yesLabel="LONG"
+                    noLabel="SHORT"
+                  />
                   <div className="kv">
                     <span className="k">
                       {settledVal != null ? "Settled value" : "Implied value"}
@@ -149,16 +260,12 @@ export default function Home() {
                   </div>
                 </>
               ) : (
-                <div className="prices">
-                  <div className="price-pill yes">
-                    <div className="lab">YES</div>
-                    <div className="val">{formatPct(longPrice)}</div>
-                  </div>
-                  <div className="price-pill no">
-                    <div className="lab">NO</div>
-                    <div className="val">{formatPct(shortPrice)}</div>
-                  </div>
-                </div>
+                <ProbBar
+                  long={longPrice}
+                  short={shortPrice}
+                  yesLabel="YES"
+                  noLabel="NO"
+                />
               )}
 
               <div className="kv">

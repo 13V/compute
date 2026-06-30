@@ -15,6 +15,7 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import BN from "bn.js";
 
 import TopBar from "../../components/TopBar";
+import { ProbBar } from "../index";
 import { RPC_URL } from "../../components/WalletProviders";
 import { useComputeClient, useReadClient } from "../../components/useComputeClient";
 import { useNow, marketStateLabel, StateBadge, CopyKey } from "../../components/ui";
@@ -280,7 +281,17 @@ export default function MarketPage() {
     return (
       <div className="container">
         <TopBar />
-        <div className="notice info">Loading market…</div>
+        <div className="skel-card" aria-hidden="true">
+          <div className="skel line" style={{ width: "60%", height: 18 }} />
+          <div className="skel line" style={{ width: "35%" }} />
+          <div className="skel bar" />
+          <div className="skel line" style={{ width: "50%" }} />
+          <div className="skel line" style={{ width: "45%" }} />
+          <div className="skel line" style={{ width: "55%", marginBottom: 0 }} />
+        </div>
+        <div className="small muted" style={{ marginTop: 12 }}>
+          Loading market…
+        </div>
       </div>
     );
   }
@@ -381,6 +392,12 @@ export default function MarketPage() {
           Market #{market.marketId.toString()} · fee {(feeBps / 100).toFixed(2)}%
         </div>
 
+        <ProbBar
+          long={longPrice}
+          short={shortPrice}
+          yesLabel={scalar ? "LONG" : "YES"}
+          noLabel={scalar ? "SHORT" : "NO"}
+        />
         <div className="prices">
           <div className="price-pill yes">
             <div className="lab">{scalar ? "LONG price" : "YES price"}</div>
