@@ -19,7 +19,7 @@ known limitations see [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 | Component | Path | Role |
 |---|---|---|
-| **Anchor program** | `programs/compute-markets/` | The on-chain protocol: 18 instructions, the `Config` and `Market` accounts, the FPMM trade math, the settlement state machine, custody of collateral in PDA vaults. The load-bearing security surface. |
+| **Anchor program** | `programs/compute-markets/` | The on-chain protocol: 21 instructions, the `Config`, `Market`, and `PriceFeed` accounts, the FPMM trade math, the settlement state machine (trusted-key **and** oracle-feed resolution), custody of collateral in PDA vaults. The load-bearing security surface. |
 | **FPMM math** | `programs/compute-markets/src/math.rs` | Pure, dependency-free arithmetic for buy/sell quotes, fees, and marginal price. No Solana/Anchor types, so it is exhaustively unit- and property-tested on the host. All economically load-bearing rounding lives here. |
 | **TypeScript SDK** | `sdk/` | PDA derivation, off-chain AMM quote helpers, a typed Anchor client, and the vendored IDL (`sdk/idl/`). |
 | **Web app** | `app/` | Next.js frontend: wallet connect, trade/redeem flows. Ships its own vendored IDL copy (`app/lib/idl/`). |
@@ -106,19 +106,26 @@ price.
 
 ## 3. Account model
 
-Two account types, both Anchor-owned:
+Three account types, all Anchor-owned:
 
 - **`Config`** — one per deployment. Holds `admin`, `pending_admin`, `guardian`,
   the `collateral_mint`, `fee_bps`, `dispute_period`, a monotonic `market_count`,
   the global `paused` flag, and the PDA bump.
 - **`Market`** — one per market. Holds identity (`market_id`, `creator`,
-  `resolver`, `resolver_kind`), the token wiring (`collateral_mint`, `yes_mint`,
+  `resolver`, `resolver_kind`), the **oracle config** (`oracle_feed`,
+  `oracle_strike`, `oracle_comparison`, `oracle_max_staleness`, used when
+  `resolver_kind == ORACLE_FEED`), the token wiring (`collateral_mint`, `yes_mint`,
   `no_mint`, `vault`, `pool_yes`, `pool_no`), the AMM state (`reserve_yes`,
   `reserve_no`, `lp`, `lp_shares`), the accounting (`collateral`, `fee_accrued`),
   the lifecycle (`state`, `outcome`, `proposed_outcome`, `close_time`,
   `resolution_time`, `resolved_at`), the display strings (`question`,
   `resolution_source`), and **64 reserved bytes** of forward-compat padding for
   future oracle resolver configs.
+- **`PriceFeed`** — a generic on-chain numeric feed (not a PDA; a fresh
+  keypair-owned account). Holds `authority`, `value`, `decimals`, `published_at`,
+  and a `description`. Read by `RESOLVER_ORACLE_FEED` markets to resolve; posted to
+  by a Switchboard On-Demand Function or a committee multisig. See
+  [`ORACLE.md`](ORACLE.md).
 
 The `Market` PDA is the **mint authority** of `yes_mint`/`no_mint` and the
 **token authority** of `vault`/`pool_yes`/`pool_no`; it signs all mint, burn, and
@@ -164,7 +171,8 @@ States (`market.state`): `OPEN = 0`, `RESOLVING = 1`, `RESOLVED = 2`,
 stateDiagram-v2
     [*] --> OPEN: create_market + seed_liquidity
     OPEN --> OPEN: buy / sell (while now < close_time)
-    OPEN --> RESOLVING: propose_outcome (resolver, now >= resolution_time)
+    OPEN --> RESOLVING: propose_outcome (resolver, TRUSTED_KEY)
+    OPEN --> RESOLVING: propose_from_oracle (anyone, ORACLE_FEED)
     OPEN --> VOID: void_stale (anyone, now > resolution_time + 7d)
     RESOLVING --> RESOLVED: finalize_outcome (anyone, after dispute_period)
     RESOLVING --> VOID: dispute_void (guardian, during dispute window)
@@ -176,14 +184,19 @@ Lifecycle in words:
 
 1. **`initialize`** (once per deployment) sets up `Config`.
 2. **`create_market`** mints the YES/NO mints and the vault, records `close_time
-   <= resolution_time`, the `resolver`, and `resolver_kind` (only `TRUSTED_KEY`
-   is accepted today).
+   <= resolution_time`, the `resolver`, and `resolver_kind` — either
+   `TRUSTED_KEY` (default) or `ORACLE_FEED` (with `oracle_feed` / `oracle_strike` /
+   `oracle_comparison` / `oracle_max_staleness`, validated per kind).
 3. **`seed_liquidity`** (creator, once) deposits collateral, mints equal YES/NO
    into the pools at 50/50, and opens trading.
 4. **`buy` / `sell`** run while `now < close_time` and not paused.
-5. **`propose_outcome`** — the `resolver` proposes a winning outcome at/after
-   `resolution_time`. State → `RESOLVING`; `resolved_at` records the proposal
-   time; **payouts stay locked**.
+5. **Step 1 of resolution → `RESOLVING`** at/after `resolution_time`, via one of
+   two paths depending on `resolver_kind` (both record `proposed_outcome` +
+   `resolved_at`; **payouts stay locked**):
+   - **`propose_outcome`** (`TRUSTED_KEY`) — the `resolver` key proposes a winning
+     outcome.
+   - **`propose_from_oracle`** (`ORACLE_FEED`, **permissionless**) — derives the
+     outcome from the bound `PriceFeed` (see the subsection below).
 6. **Dispute window** of `config.dispute_period` seconds:
    - **`finalize_outcome`** (permissionless) after the window → `RESOLVED`.
    - **`dispute_void`** (guardian) during the window → `VOID` (reason `DISPUTE`).
@@ -199,6 +212,30 @@ This is the "defense in depth" design: the resolver only *proposes*, a timelock
 delays payout, a guardian can veto, and a liveness hatch guarantees collateral is
 never permanently stranded. See [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
+### Oracle resolution path
+
+A `RESOLVER_ORACLE_FEED` market is proposed by `propose_from_oracle` instead of
+`propose_outcome`. The two instructions are interchangeable **only** at step 1 of
+resolution: both feed the *same* `RESOLVING` state, the *same* dispute window, and
+the *same* `finalize_outcome` / `dispute_void` exits — the only difference is where
+the proposed outcome comes from.
+
+`propose_from_oracle` is **permissionless** (any cranker may call it). At/after
+`resolution_time` it reads the bound `PriceFeed` (validated by `address =
+market.oracle_feed`), rejects an unpublished (`FeedHasNoValue`) or stale
+(`now - published_at > oracle_max_staleness` → `StaleFeed`) feed, then derives the
+outcome by comparing `feed.value` to `oracle_strike` under `oracle_comparison`
+(`CMP_GTE` ⇒ YES iff `value >= strike`; `CMP_LTE` ⇒ YES iff `value <= strike`) —
+exact integer math, boundary inclusive. It sets `state = RESOLVING`, records
+`resolved_at`, and emits `OutcomeProposed` with the **feed pubkey** as the nominal
+`resolver`. The complementary `init_price_feed` / `publish_price` instructions
+create and post to the feed. Because the oracle proposal still passes through the
+dispute window, the guardian can `dispute_void` a manipulated feed — the trust on a
+feed rests on its `authority` (a Switchboard On-Demand Function enclave or a
+committee multisig), not a single resolver key. The program reads a first-party
+`PriceFeed`; it does not parse Switchboard's native account. Full design,
+manipulation analysis, and a worked example are in [`ORACLE.md`](ORACLE.md).
+
 ## 5. Event flow for indexers
 
 Every state-changing instruction emits an Anchor event (CPI log). An indexer
@@ -210,13 +247,15 @@ reconcile balances from these alone:
 | `MarketCreated` | `create_market` | `market_id`, `market`, `creator`, `resolver`, `close_time`, `resolution_time` |
 | `LiquiditySeeded` | `seed_liquidity` | `market`, `amount` |
 | `TradeExecuted` | `buy` / `sell` | `market`, `user`, `is_buy`, `outcome`, `collateral` (gross), `tokens` |
-| `OutcomeProposed` | `propose_outcome` | `market`, `resolver`, `outcome`, `proposed_at` |
+| `OutcomeProposed` | `propose_outcome` / `propose_from_oracle` | `market`, `resolver` (the feed pubkey on the oracle path), `outcome`, `proposed_at` |
 | `MarketResolved` | `finalize_outcome` | `market`, `outcome`, `resolved_at` (finalize time) |
 | `MarketVoided` | `dispute_void` / `void_stale` | `market`, `reason` (`0 = DISPUTE`, `1 = STALE`) |
 | `Redeemed` | `redeem` / `redeem_void` | `market`, `user`, `amount` (tokens burned), `payout` (collateral out) |
 | `PoolClaimed` | `claim_pool` | `market`, `lp`, `payout` |
 | `FeesCollected` | `collect_fees` | `market`, `amount` |
 | `PausedSet` | `set_paused` | `paused` |
+| `PriceFeedInitialized` | `init_price_feed` | `feed`, `authority` |
+| `PricePublished` | `publish_price` | `feed`, `value`, `published_at` |
 
 Notes for indexers:
 

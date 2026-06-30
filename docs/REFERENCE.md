@@ -8,7 +8,7 @@ IDL (`target/idl/compute_markets.json`).
 - **Program ID:** `8xv1L7757szxo2XPrQL5AERPGZrJaYRKgqB9RgFkQCU2`
 - **Anchor / Solana:** Anchor `0.31.1`, legacy SPL Token.
 - **Decimals:** collateral and outcome tokens use 6 decimals.
-- **Counts:** 18 instructions · 2 accounts · 10 events · 26 error variants.
+- **Counts:** 21 instructions · 3 accounts · 12 events · 30 error variants.
 
 > **Authoritative PDA layout.** The seeds below describe the **shipped binary
 > FPMM program** and supersede the generic PDA sketch in `docs/RESEARCH.md` §7
@@ -24,7 +24,10 @@ IDL (`target/idl/compute_markets.json`).
 | `STATE_RESOLVING` | `1` | Outcome proposed; in the dispute window. |
 | `STATE_RESOLVED` | `2` | Finalized to a YES/NO outcome; winners redeem 1:1. |
 | `STATE_VOID` | `3` | Voided; every token redeems for half collateral. |
-| `RESOLVER_TRUSTED_KEY` | `0` | The only `resolver_kind` wired today. |
+| `RESOLVER_TRUSTED_KEY` | `0` | Trusted single-key resolver (the default). |
+| `RESOLVER_ORACLE_FEED` | `1` | Oracle-feed resolver: resolved from a `PriceFeed` (see [`ORACLE.md`](ORACLE.md)). |
+| `CMP_GTE` | `0` | Oracle comparison: YES iff `feed.value >= oracle_strike`. |
+| `CMP_LTE` | `1` | Oracle comparison: YES iff `feed.value <= oracle_strike`. |
 | `VOID_REASON_DISPUTE` | `0` | Voided by guardian veto. |
 | `VOID_REASON_STALE` | `1` | Voided by liveness escape hatch. |
 | `MAX_FEE_BPS` | `1000` | Maximum protocol fee (10%). |
@@ -51,29 +54,34 @@ account's pubkey. All PDAs are derived from the program ID.
 
 ## Instructions
 
-Eighteen instructions. "Signer" is the privileged caller; remaining accounts are
-abbreviated (full lists are in the IDL). PDAs are derived as above.
+Twenty-one instructions. "Signer" is the privileged caller; remaining accounts are
+abbreviated (full lists are in the IDL). PDAs are derived as above. The three
+oracle instructions (`init_price_feed`, `publish_price`, `propose_from_oracle`) are
+detailed further in [`ORACLE.md`](ORACLE.md).
 
 | # | Instruction | Args | Who may call | Signer | Effect |
 |---|---|---|---|---|---|
 | 1 | `initialize` | `fee_bps: u16`, `dispute_period: i64`, `guardian: Pubkey` | anyone (becomes admin) | `admin` | Create the singleton `Config`. One-time, irreversible. Validates `fee_bps <= 1000` and `0 <= dispute_period <= 30d`. |
-| 2 | `create_market` | `question: String`, `resolution_source: String`, `close_time: i64`, `resolution_time: i64`, `resolver: Pubkey`, `resolver_kind: u8` | **anyone** (permissionless) | `creator` | Create a market + YES/NO mints + vault. Requires `resolver_kind == 0`, `resolver != default`, `close_time <= resolution_time`, `now < resolution_time <= now + horizon`, strings within length. Increments `market_count`. |
+| 2 | `create_market` | `question: String`, `resolution_source: String`, `close_time: i64`, `resolution_time: i64`, `resolver: Pubkey`, `resolver_kind: u8`, `oracle_feed: Pubkey`, `oracle_strike: i64`, `oracle_comparison: u8`, `oracle_max_staleness: i64` | **anyone** (permissionless) | `creator` | Create a market + YES/NO mints + vault. Validates `close_time <= resolution_time`, `now < resolution_time <= now + horizon`, strings within length, and the resolver config **per kind**: `TRUSTED_KEY` ⇒ `resolver != default`; `ORACLE_FEED` ⇒ `oracle_feed != default`, `oracle_max_staleness > 0`, known `oracle_comparison`. Any other kind ⇒ `UnsupportedResolverKind`. Increments `market_count`. |
 | 3 | `seed_liquidity` | `amount: u64` | market `creator` only, once | `lp` (= creator) | Create the YES/NO pools, deposit `amount` collateral, mint `amount` of each outcome at 50/50, set `lp`/`lp_shares`. Requires `OPEN`, not paused, not already seeded, `amount > 0`. |
 | 4 | `buy` | `outcome: u8`, `collateral_in: u64`, `min_tokens_out: u64` | anyone | `user` | Invest collateral, mint a full set, swap out the bought side. Requires `OPEN`, not paused, `now < close_time`, liquidity present, `tokens_out >= min_tokens_out`. |
 | 5 | `sell` | `outcome: u8`, `collateral_out: u64`, `max_tokens_in: u64` | anyone | `user` | Return outcome tokens, merge a full set out, pay collateral (net of fee). Requires `OPEN`, not paused, `now < close_time`, `collateral_out <= collateral`, `tokens_in <= max_tokens_in`. |
-| 6 | `propose_outcome` | `outcome: u8` | market `resolver` only | `resolver` | Step 1 of resolution. `OPEN → RESOLVING`; records `proposed_outcome` + `resolved_at`. Requires `now >= resolution_time`. Opens the dispute window. |
-| 7 | `finalize_outcome` | — | **anyone** (crank) | `cranker` | Step 2 of resolution. `RESOLVING → RESOLVED`; sets `outcome = proposed_outcome`. Requires `now >= resolved_at + dispute_period`. |
-| 8 | `dispute_void` | — | `guardian` only | `guardian` | Guardian veto. `RESOLVING → VOID` (reason DISPUTE). Requires `now < resolved_at + dispute_period` (within the window). |
-| 9 | `void_stale` | — | **anyone** (crank) | `cranker` | Liveness hatch. `OPEN → VOID` (reason STALE). Requires `now > resolution_time + 7d`. |
-| 10 | `redeem` | `amount: u64` | any winning-token holder | `user` | Burn `amount` winning tokens for `amount` collateral. Requires `RESOLVED`, correct `winning_mint`, `amount <= collateral`. |
-| 11 | `redeem_void` | `amount: u64` | any YES/NO holder | `user` | Burn `amount` of **either** outcome token for `amount / 2` collateral (rounded down). Requires `VOID`. |
-| 12 | `claim_pool` | — | market `lp` only | `lp` | After settlement, LP reclaims pool reserves as collateral: winning reserve (RESOLVED) or half of each reserve (VOID). Requires `RESOLVED` or `VOID`, something to claim. |
-| 13 | `collect_fees` | — | `admin` only | `admin` | Sweep `fee_accrued` for this market to the admin's token account; resets it to 0. Requires `fee_accrued > 0`. |
-| 14 | `set_paused` | `paused: bool` | `admin` **or** `guardian` | `authority` | Toggle the global pause flag. Emits `PausedSet`. |
-| 15 | `set_fee_bps` | `fee_bps: u16` | `admin` only | `admin` | Update the taker fee. Re-checks `fee_bps <= 1000`. |
-| 16 | `set_guardian` | `guardian: Pubkey` | `admin` only | `admin` | Replace the guardian key. |
-| 17 | `set_admin` | `new_admin: Pubkey` | `admin` only | `admin` | Two-step transfer step 1: nominate `pending_admin`. |
-| 18 | `accept_admin` | — | the nominated `pending_admin` | `pending_admin` | Two-step transfer step 2: accept; sets `admin`, clears `pending_admin`. |
+| 6 | `propose_outcome` | `outcome: u8` | market `resolver` only | `resolver` | Step 1 of resolution (trusted key). `OPEN → RESOLVING`; records `proposed_outcome` + `resolved_at`. Requires `resolver_kind == TRUSTED_KEY` (else `WrongResolverKind`) and `now >= resolution_time`. Opens the dispute window. |
+| 7 | `propose_from_oracle` | — | **anyone** (crank) | `cranker` | Step 1 of resolution (oracle). `OPEN → RESOLVING`; derives `proposed_outcome` from the bound `PriceFeed`. Requires `resolver_kind == ORACLE_FEED` (else `WrongResolverKind`), `now >= resolution_time`, `feed.published_at > 0` (else `FeedHasNoValue`), `now - published_at <= oracle_max_staleness` (else `StaleFeed`). `OutcomeProposed.resolver` is the feed pubkey. See [`ORACLE.md`](ORACLE.md). |
+| 8 | `finalize_outcome` | — | **anyone** (crank) | `cranker` | Step 2 of resolution. `RESOLVING → RESOLVED`; sets `outcome = proposed_outcome`. Requires `now >= resolved_at + dispute_period`. Reused by both resolver kinds. |
+| 9 | `dispute_void` | — | `guardian` only | `guardian` | Guardian veto. `RESOLVING → VOID` (reason DISPUTE). Requires `now < resolved_at + dispute_period` (within the window). Applies to both resolver kinds. |
+| 10 | `void_stale` | — | **anyone** (crank) | `cranker` | Liveness hatch. `OPEN → VOID` (reason STALE). Requires `now > resolution_time + 7d`. |
+| 11 | `redeem` | `amount: u64` | any winning-token holder | `user` | Burn `amount` winning tokens for `amount` collateral. Requires `RESOLVED`, correct `winning_mint`, `amount <= collateral`. |
+| 12 | `redeem_void` | `amount: u64` | any YES/NO holder | `user` | Burn `amount` of **either** outcome token for `amount / 2` collateral (rounded down). Requires `VOID`. |
+| 13 | `claim_pool` | — | market `lp` only | `lp` | After settlement, LP reclaims pool reserves as collateral: winning reserve (RESOLVED) or half of each reserve (VOID). Requires `RESOLVED` or `VOID`, something to claim. |
+| 14 | `collect_fees` | — | `admin` only | `admin` | Sweep `fee_accrued` for this market to the admin's token account; resets it to 0. Requires `fee_accrued > 0`. |
+| 15 | `init_price_feed` | `description: String`, `decimals: u8` | anyone (becomes `authority`) | `feed` (new keypair) + `authority` | Create a fresh (non-PDA) `PriceFeed` account. Initializes `value = 0`, `published_at = 0`; caller becomes `authority`. Requires `description` ≤ 64 bytes. Emits `PriceFeedInitialized`. |
+| 16 | `publish_price` | `value: i64` | feed `authority` only | `authority` | Set `feed.value` and stamp `published_at = now`. Emits `PricePublished`. |
+| 17 | `set_paused` | `paused: bool` | `admin` **or** `guardian` | `authority` | Toggle the global pause flag. Emits `PausedSet`. |
+| 18 | `set_fee_bps` | `fee_bps: u16` | `admin` only | `admin` | Update the taker fee. Re-checks `fee_bps <= 1000`. |
+| 19 | `set_guardian` | `guardian: Pubkey` | `admin` only | `admin` | Replace the guardian key. |
+| 20 | `set_admin` | `new_admin: Pubkey` | `admin` only | `admin` | Two-step transfer step 1: nominate `pending_admin`. |
+| 21 | `accept_admin` | — | the nominated `pending_admin` | `pending_admin` | Two-step transfer step 2: accept; sets `admin`, clears `pending_admin`. |
 
 ### Account lists (key accounts per instruction)
 
@@ -83,6 +91,9 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 |---|---|
 | `initialize` | `config` (init), `collateral_mint`, `admin` (signer) |
 | `create_market` | `config` (mut), `market` (init), `yes_mint`/`no_mint`/`vault` (init), `collateral_mint`, `creator` (signer) |
+| `init_price_feed` | `feed` (init, signer), `authority` (signer) |
+| `publish_price` | `feed` (mut), `authority` (signer) |
+| `propose_from_oracle` | `market` (mut), `feed` (= `market.oracle_feed`), `cranker` (signer) |
 | `seed_liquidity` | `config`, `market` (mut), `yes_mint`/`no_mint`/`vault` (mut), `pool_yes`/`pool_no` (init), `lp_collateral`, `lp` (signer) |
 | `buy` / `sell` | `config`, `market` (mut), `yes_mint`/`no_mint`/`pool_yes`/`pool_no`/`vault` (mut), `user_outcome`, `user_collateral`, `user` (signer) |
 | `propose_outcome` | `market` (mut), `resolver` (signer) |
@@ -118,8 +129,12 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 |---|---|---|
 | `market_id` | `u64` | Sequential id; PDA seed. |
 | `creator` | `pubkey` | Who created the market and may seed it. |
-| `resolver` | `pubkey` | Key allowed to `propose_outcome`. |
-| `resolver_kind` | `u8` | Resolver type. Only `0` (TRUSTED_KEY) is accepted today. |
+| `resolver` | `pubkey` | Key allowed to `propose_outcome` (trusted-key markets). |
+| `resolver_kind` | `u8` | Resolver type: `0` TRUSTED_KEY (default) or `1` ORACLE_FEED. |
+| `oracle_feed` | `pubkey` | Bound `PriceFeed` (used when `resolver_kind == ORACLE_FEED`). |
+| `oracle_strike` | `i64` | Strike compared against the feed value, in the feed's native integer scale. |
+| `oracle_comparison` | `u8` | `0` CMP_GTE (YES iff `value >= strike`) or `1` CMP_LTE (YES iff `value <= strike`). |
+| `oracle_max_staleness` | `i64` | Max allowed `now - feed.published_at` (seconds) when proposing from the oracle. |
 | `collateral_mint` | `pubkey` | Collateral mint (matches `Config`). |
 | `yes_mint` / `no_mint` | `pubkey` | Outcome token mints (authority = this PDA). |
 | `vault` | `pubkey` | Collateral token account (authority = this PDA). |
@@ -140,6 +155,21 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 | `reserved` | `[u8; 64]` | Forward-compat padding for future oracle configs. |
 | `bump` | `u8` | PDA bump. |
 
+### `PriceFeed` (not a PDA — fresh keypair account)
+
+A generic on-chain numeric feed read by `RESOLVER_ORACLE_FEED` markets. Created by
+`init_price_feed` (pass a new keypair as `feed`); posted to by `publish_price`. In
+production its `authority` is a Switchboard On-Demand Function enclave key or a
+committee multisig. See [`ORACLE.md`](ORACLE.md).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `authority` | `pubkey` | The only key allowed to `publish_price`. |
+| `value` | `i64` | Latest posted value, in the feed's native fixed-point integer scale. |
+| `decimals` | `u8` | Informational scale hint; **not** used in any on-chain comparison. |
+| `published_at` | `i64` | Unix time of the last publish; `0` = never published. |
+| `description` | `String` | Human label (≤ 64 bytes). |
+
 ## Events
 
 | Event | Fields |
@@ -154,6 +184,12 @@ PDAs validated by seeds/address; token programs and sysvars omitted for brevity.
 | `PoolClaimed` | `market: pubkey`, `lp: pubkey`, `payout: u64` |
 | `FeesCollected` | `market: pubkey`, `amount: u64` |
 | `PausedSet` | `paused: bool` |
+| `PriceFeedInitialized` | `feed: pubkey`, `authority: pubkey` |
+| `PricePublished` | `feed: pubkey`, `value: i64`, `published_at: i64` |
+
+Note `OutcomeProposed` is emitted by **both** `propose_outcome` and
+`propose_from_oracle`; in the oracle case its `resolver` field carries the feed
+pubkey.
 
 ## Errors
 
@@ -186,7 +222,11 @@ Anchor custom errors start at code `6000` (`0x1770`).
 | 6022 | `TooEarlyToResolve` | `propose_outcome` before `resolution_time`. |
 | 6023 | `TooEarlyToVoid` | `void_stale` before `resolution_time + 7d`. |
 | 6024 | `NothingToClaim` | Nothing to claim/collect (zero reserve or fee). |
-| 6025 | `MathOverflow` | Arithmetic overflow / checked-math failure. |
+| 6025 | `WrongResolverKind` | Instruction used on the wrong `resolver_kind` (e.g. `propose_outcome` on an oracle market, or `propose_from_oracle` on a trusted-key market). |
+| 6026 | `InvalidComparison` | Unknown `oracle_comparison` code (must be `0` GTE or `1` LTE). |
+| 6027 | `FeedHasNoValue` | The bound `PriceFeed` has never been published (`published_at == 0`). |
+| 6028 | `StaleFeed` | The feed value is older than `oracle_max_staleness` at proposal time. |
+| 6029 | `MathOverflow` | Arithmetic overflow / checked-math failure. |
 
 ## FPMM math (off-chain reference)
 
@@ -198,6 +238,7 @@ The host-tested functions in `math.rs`, mirrored by the SDK quote helpers:
 | `quote_sell(reserve_sold, reserve_other, a)` | `tokens_in`, `new_reserve_sold = ceil(k/(reserve_other−a))`, `new_reserve_other = reserve_other − a`. Requires `a < reserve_other`. |
 | `marginal_price_micro(reserve_self, reserve_other)` | `reserve_other / (reserve_self + reserve_other) · 1e6` (probability ×1e6). |
 | `fee_amount(amount, fee_bps)` | `floor(amount · fee_bps / 10_000)`. |
+| `oracle_is_yes(value, strike, comparison)` | `Some(value >= strike)` for `CMP_GTE`, `Some(value <= strike)` for `CMP_LTE`, `None` for any other code. Exact integer comparison; boundary inclusive. |
 
 All rounding keeps the pool's constant product non-decreasing: the retained
 reserve is rounded **up**, so the trader gets slightly fewer tokens on a buy and

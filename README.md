@@ -66,16 +66,22 @@ A manual resolver is a trusted component, so settlement is defended in depth:
   last-look.
 - **Pause switch.** Admin or guardian can pause trading in an incident.
 - **Two-step admin transfer** (`set_admin` → `accept_admin`).
-- **Forward-compat oracles.** `resolver_kind` + 64 reserved bytes leave room for pluggable
-  Switchboard/Pyth/optimistic resolvers without a layout-breaking change — but only the
-  trusted-key resolver (`resolver_kind = 0`) is wired today.
+- **Oracle-feed resolver (feed-bridge adapter).** A market may instead set
+  `resolver_kind = 1` (`ORACLE_FEED`) and bind an on-chain `PriceFeed`; anyone can then
+  `propose_from_oracle` after `resolution_time`, which compares the feed value to the market's
+  strike and proposes the outcome — flowing through the **same** dispute window + guardian veto,
+  with a staleness guard. The feed is posted to by a Switchboard On-Demand Function (TEE-attested)
+  or a committee multisig; the trusted key remains the default. See [`docs/ORACLE.md`](docs/ORACLE.md).
+- **Forward-compat oracles.** `resolver_kind` + 64 reserved bytes leave room for the remaining
+  resolvers (native Switchboard-account parsing / Pyth / optimistic) without a layout-breaking
+  change — those are not yet wired.
 
-### Instructions (18)
+### Instructions (21)
 
 `initialize` · `create_market` · `seed_liquidity` · `buy` · `sell` · `propose_outcome` ·
-`finalize_outcome` · `dispute_void` · `void_stale` · `redeem` · `redeem_void` ·
-`claim_pool` · `collect_fees` · `set_paused` · `set_fee_bps` · `set_guardian` ·
-`set_admin` · `accept_admin`.
+`propose_from_oracle` · `finalize_outcome` · `dispute_void` · `void_stale` · `redeem` ·
+`redeem_void` · `claim_pool` · `collect_fees` · `init_price_feed` · `publish_price` ·
+`set_paused` · `set_fee_bps` · `set_guardian` · `set_admin` · `accept_admin`.
 
 Full surface (every instruction, account, error, event, PDA seed) is in
 [`docs/REFERENCE.md`](docs/REFERENCE.md).
@@ -142,6 +148,7 @@ upgrade-authority custody via a Squads multisig) is in
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, the FPMM split/swap math, account + PDA model, resolution state machine, event flow. |
 | [`docs/REFERENCE.md`](docs/REFERENCE.md) | Exhaustive surface: PDA seeds, instructions, accounts, errors, events. |
+| [`docs/ORACLE.md`](docs/ORACLE.md) | Oracle-feed resolver: the `PriceFeed` account, comparison/strike semantics, `propose_from_oracle`, wiring a Switchboard Function or committee as the feed authority. |
 | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Trusted roles & powers, defenses, residual trust, non-goals, proven invariants. |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Build → deploy → initialize → create/seed runbook + key custody. |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Resolver checklist, guardian playbook, cranking, fee sweeps, monitoring. |
@@ -152,10 +159,13 @@ upgrade-authority custody via a Squads multisig) is in
 ## MVP scope & limitations
 
 This MVP is intentionally focused: **binary** markets, FPMM trading, **single-seed**
-liquidity, and a **trusted resolver key** (defended in depth, but not a real oracle). Known
-non-goals today: no real oracle (Switchboard/Pyth/optimistic are designed-for but
-unimplemented), no scalar/range markets, no multi-LP shares, and the guardian can only
-*void* a bad proposal (50/50 refund), not correct it. The load-bearing next steps are a
-**real settlement oracle** and **scalar/range markets** — see
-[`docs/RESEARCH.md`](docs/RESEARCH.md) and [`docs/WORLDCLASS.md`](docs/WORLDCLASS.md).
-**Not audited; do not use with real funds.**
+liquidity, and a **trusted resolver key by default** (defended in depth). Settlement now also
+offers an **oracle feed-bridge adapter**: markets can resolve from an on-chain `PriceFeed`
+posted to by a Switchboard On-Demand Function or a committee multisig, still passing through the
+dispute window + guardian veto (see [`docs/ORACLE.md`](docs/ORACLE.md)) — but the trusted key
+remains the default and the residual trust shifts to the feed authority rather than disappearing.
+Known non-goals today: native Switchboard-account parsing / Pyth / optimistic resolvers remain
+future, no scalar/range markets, no multi-LP shares, and the guardian can only *void* a bad
+proposal (50/50 refund), not correct it. The load-bearing next steps are **hardening the oracle
+layer** and **scalar/range markets** — see [`docs/RESEARCH.md`](docs/RESEARCH.md) and
+[`docs/WORLDCLASS.md`](docs/WORLDCLASS.md). **Not audited; do not use with real funds.**

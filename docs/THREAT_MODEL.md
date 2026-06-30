@@ -8,16 +8,20 @@ program**.
 
 > **Bottom line.** The arithmetic core is sound and property-tested; the
 > conservation invariant holds across every instruction. The remaining trust is
-> concentrated in **settlement**: a single trusted `resolver` key proposes the
-> outcome. That power is deliberately defended in depth — a two-step timelock, a
-> guardian veto, and a liveness escape hatch — but it is a real, documented trust
-> assumption, not an oracle. **Not audited; do not use with real funds.**
+> concentrated in **settlement**: the proposed outcome comes from either a single
+> trusted `resolver` key (default) or, for oracle-feed markets, the `authority` of
+> a bound on-chain `PriceFeed` (a feed-bridge adapter — see [`ORACLE.md`](ORACLE.md)).
+> Either way that power is deliberately defended in depth — a two-step timelock, a
+> guardian veto, and a liveness escape hatch — and even an oracle proposal is
+> *vetoable*, not final. It is a real, documented trust assumption; the feed-bridge
+> adapter narrows but does not eliminate it. **Not audited; do not use with real funds.**
 
 ## 1. Trusted roles and their exact powers
 
-There are four privileged roles. Each is a single key today (operators **should**
-back the admin, guardian, and upgrade authority with a Squads multisig — see
-[`DEPLOYMENT.md`](DEPLOYMENT.md)).
+There are four global/per-market privileged roles below, plus a per-feed **feed
+authority** that resolves oracle-feed markets. Each is a single key today
+(operators **should** back the admin, guardian, and upgrade authority with a Squads
+multisig — see [`DEPLOYMENT.md`](DEPLOYMENT.md)).
 
 ### Admin (`Config.admin`)
 
@@ -54,20 +58,46 @@ back the admin, guardian, and upgrade authority with a Squads multisig — see
 - Collect fees, change fees, or transfer admin.
 - Touch collateral directly.
 
-### Resolver (`Market.resolver`, per market)
+### Resolver (`Market.resolver`, per market — trusted-key markets)
 
 **CAN:**
 
 - Propose the winning outcome `propose_outcome`, at/after `resolution_time`,
-  which starts the dispute window.
+  which starts the dispute window. Only on `RESOLVER_TRUSTED_KEY` markets.
 
 **CANNOT:**
 
 - Finalize the outcome (that is permissionless, and only after the timelock).
 - Propose before `resolution_time`, or after the market has left OPEN.
+- Propose on a `RESOLVER_ORACLE_FEED` market (reverts `WrongResolverKind`).
 - Move funds. Proposing only writes `proposed_outcome` + `resolved_at`; **no
   payout happens at proposal time.**
 - Override a guardian veto.
+
+### Feed authority (`PriceFeed.authority`, per feed — oracle-feed markets)
+
+On `RESOLVER_ORACLE_FEED` markets the trusted resolver key is replaced by the
+**authority of the bound `PriceFeed`** (a Switchboard On-Demand Function enclave or
+a committee multisig — see [`ORACLE.md`](ORACLE.md)). It is the new locus of
+settlement trust for those markets.
+
+**CAN:**
+
+- Set the feed's `value` and stamp `published_at` via `publish_price`. The posted
+  value (compared to the market's `oracle_strike` under `oracle_comparison`) is
+  what `propose_from_oracle` turns into a proposed outcome.
+
+**CANNOT:**
+
+- Propose, finalize, or void any market directly; it only writes the feed. The
+  proposal is a separate, **permissionless** `propose_from_oracle` call that runs
+  the comparison and enters the **same dispute window**.
+- Bypass the staleness guard: a value older than `oracle_max_staleness` at proposal
+  time is rejected (`StaleFeed`), and an unpublished feed is rejected
+  (`FeedHasNoValue`).
+- Pick the strike/comparison (fixed at `create_market`) or move funds.
+- Override a guardian veto — a manipulated feed value yields a *vetoable* proposal,
+  not a final one.
 
 ### Upgrade authority (Solana BPF loader, off-program)
 
@@ -96,8 +126,8 @@ dies" — is bounded by four independent mechanisms:
 
 | Defense | Mechanism | Bounds which power |
 |---|---|---|
-| **Two-step resolution + timelock** | `propose_outcome` → wait `dispute_period` → `finalize_outcome`. Payouts stay locked during the window. | A wrong/malicious resolver proposal is not immediately actionable. |
-| **Guardian veto** | `dispute_void` during the window → `STATE_VOID` (50/50 refund). | A bad proposal or compromised resolver. |
+| **Two-step resolution + timelock** | `propose_outcome` **or** `propose_from_oracle` → wait `dispute_period` → `finalize_outcome`. Payouts stay locked during the window. | A wrong/malicious resolver proposal — or a manipulated oracle feed — is not immediately actionable. |
+| **Guardian veto** | `dispute_void` during the window → `STATE_VOID` (50/50 refund). | A bad proposal, a compromised resolver, **or a manipulated `PriceFeed` value** (the oracle path enters the same window). |
 | **Liveness escape hatch** | `void_stale` after `resolution_time + VOID_GRACE_PERIOD` (7 days) if still OPEN → `STATE_VOID`. Permissionless. | A resolver who never proposes; prevents permanently stranded collateral. |
 | **Pause switch** | `set_paused` by admin **or** guardian halts `buy`/`sell`/`seed_liquidity`. | Incident response while a fix is deployed. |
 
@@ -106,10 +136,16 @@ Additional structural guards:
 - **Trading halts at `close_time`** (`now < close_time` enforced in buy/sell),
   with `close_time <= resolution_time`, so there is no informed last-look trading
   after the market should be settled.
+- **Oracle-feed staleness guard.** On a `RESOLVER_ORACLE_FEED` market,
+  `propose_from_oracle` rejects an unpublished feed (`FeedHasNoValue`) and any value
+  older than `oracle_max_staleness` (`StaleFeed`), so settlement cannot run on a
+  silently-frozen feed; a feed that never refreshes leaves the market to the
+  liveness hatch (`void_stale`) instead.
 - **`resolver_kind` + 64 reserved bytes** make room for pluggable oracle
-  resolvers (Switchboard / Pyth / optimistic) **without a layout-breaking
-  migration**. Only `RESOLVER_TRUSTED_KEY = 0` is accepted today; any other kind
-  reverts with `UnsupportedResolverKind`.
+  resolvers **without a layout-breaking migration**. Two kinds are wired today —
+  `RESOLVER_TRUSTED_KEY = 0` (default) and `RESOLVER_ORACLE_FEED = 1` (the
+  feed-bridge adapter); native Switchboard-account parsing / Pyth / optimistic
+  remain future. Any unknown kind reverts with `UnsupportedResolverKind`.
 - **Two-step admin transfer** (`set_admin` → `accept_admin`) prevents handing
   admin to a wrong/dead key in one step.
 
@@ -117,12 +153,19 @@ Additional structural guards:
 
 Even with the defenses above, you must trust:
 
-1. **The resolver reports honestly (the core assumption).** `resolver_kind` is
-   `TRUSTED_KEY`: the outcome is whatever the `resolver` key proposes. There is
-   **no oracle**. The only thing standing between a dishonest proposal and a
-   wrong payout is the **guardian** (who can only veto into a void, not correct
-   the outcome) acting **within the dispute window**. If the resolver is
-   dishonest *and* the guardian fails to veto in time, the wrong side is paid.
+1. **The proposed value is honest (the core assumption).** For a `TRUSTED_KEY`
+   market the outcome is whatever the `resolver` key proposes. For a
+   `RESOLVER_ORACLE_FEED` market it is derived from the bound `PriceFeed`, whose
+   `authority` (a Switchboard On-Demand Function enclave or a committee multisig —
+   see [`ORACLE.md`](ORACLE.md)) you must trust to post the licensed off-chain index
+   honestly. The feed-bridge adapter **narrows** this trust — a TEE-attested or
+   multisig feed is harder to forge than a single resolver key, and the program
+   does not parse Switchboard's native account (the `PriceFeed` is the integration
+   boundary) — but it does not remove it. In both cases the only thing standing
+   between a dishonest/manipulated value and a wrong payout is the **guardian** (who
+   can only veto into a void, not correct the outcome) acting **within the dispute
+   window**. If the value is wrong *and* the guardian fails to veto in time, the
+   wrong side is paid.
 2. **The guardian is available and honest during dispute windows.** It is the
    sole corrective for a bad proposal. A compromised guardian could grief by
    voiding good resolutions (→ 50/50 refunds) or by pausing trading; it cannot
@@ -141,9 +184,19 @@ Even with the defenses above, you must trust:
 These are **intended scope cuts**, not bugs. Documented so no one mistakes the
 MVP for a finished oracle-backed protocol.
 
-- **No real oracle.** Settlement is a trusted key. Switchboard/Pyth/optimistic
-  resolvers are designed-for (`resolver_kind` + reserved padding) but **not
-  implemented**.
+**Partially addressed:**
+
+- **Oracle resolution — a feed-bridge adapter now exists.** `RESOLVER_ORACLE_FEED`
+  markets resolve permissionlessly from an on-chain `PriceFeed` that a Switchboard
+  On-Demand Function or a committee multisig posts to, gated by the same dispute
+  window + guardian veto + a staleness guard (see [`ORACLE.md`](ORACLE.md)). What
+  remains future: **native Switchboard-account parsing in-program, a Pyth pull
+  oracle, and a Solana-native optimistic oracle.** The program reads a first-party
+  `PriceFeed` (the documented integration boundary); it does not parse Switchboard's
+  native account.
+
+**Hard non-goals:**
+
 - **No scalar / range markets.** Binary YES/NO only. The research-designated
   flagship (a scalar GPU-price market) cannot yet be expressed.
 - **Single-seed liquidity.** One LP per market (`lp` / `lp_shares` is the
@@ -187,6 +240,8 @@ The program's safety rests on these, asserted by unit/property tests
 | Scenario | Outcome |
 |---|---|
 | Resolver proposes the wrong outcome | Guardian `dispute_void`s within the window → 50/50 refund. If the guardian misses the window, the wrong side is paid (residual trust #1/#2). |
+| Compromised feed authority posts a manipulated value | `propose_from_oracle` enters the **same** dispute window; the guardian can `dispute_void` the resulting proposal → 50/50 refund. The bad value is *vetoable*, not final (residual trust #1). |
+| Oracle feed is frozen / never updated near resolution | `propose_from_oracle` reverts (`StaleFeed` / `FeedHasNoValue`); the market falls through to `void_stale` after `resolution_time + 7d`. No settlement on a stale value. |
 | Resolver disappears (never proposes) | After `resolution_time + 7d`, anyone `void_stale`s → 50/50 refund. Collateral is never permanently stranded. |
 | Compromised admin | Can pause, set fee ≤ 10%, sweep `fee_accrued`. Cannot touch collateral, resolve, or void. |
 | Compromised guardian | Can pause and void good resolutions (grief). Cannot pick a winner or steal funds. |
