@@ -62,16 +62,21 @@ multisig — see [`DEPLOYMENT.md`](DEPLOYMENT.md)).
 
 **CAN:**
 
-- Propose the winning outcome `propose_outcome`, at/after `resolution_time`,
-  which starts the dispute window. Only on `RESOLVER_TRUSTED_KEY` markets.
+- Propose the winning outcome `propose_outcome` (binary) or a settlement value
+  `propose_scalar(value)` (scalar), at/after `resolution_time`, which starts the
+  dispute window. Only on `RESOLVER_TRUSTED_KEY` markets.
 
 **CANNOT:**
 
-- Finalize the outcome (that is permissionless, and only after the timelock).
+- Finalize the outcome (that is permissionless, and only after the timelock). For
+  scalar markets, finalize is what maps `proposed_value` to the settlement
+  fraction; the resolver only supplies the raw value.
 - Propose before `resolution_time`, or after the market has left OPEN.
-- Propose on a `RESOLVER_ORACLE_FEED` market (reverts `WrongResolverKind`).
-- Move funds. Proposing only writes `proposed_outcome` + `resolved_at`; **no
-  payout happens at proposal time.**
+- Propose on a `RESOLVER_ORACLE_FEED` market (reverts `WrongResolverKind`), or use
+  the wrong proposal instruction for the `market_kind` (`propose_outcome` on a
+  scalar market / `propose_scalar` on a binary market reverts `WrongMarketKind`).
+- Move funds. Proposing only writes `proposed_outcome`/`proposed_value` +
+  `resolved_at`; **no payout happens at proposal time.**
 - Override a guardian veto.
 
 ### Feed authority (`PriceFeed.authority`, per feed — oracle-feed markets)
@@ -114,10 +119,14 @@ settlement trust for those markets.
 
 ### Unprivileged actors (anyone)
 
-Anyone may `create_market`, `seed_liquidity` (if they are the creator), `buy`,
-`sell`, `redeem`, `redeem_void`, `claim_pool` (if they are the LP),
-`finalize_outcome` (crank), and `void_stale` (crank). Permissionless cranking of
-finalize/void is a feature: it removes liveness dependence on any single actor.
+Anyone may `create_market`, `seed_liquidity` (if they are the creator),
+`add_liquidity`, `remove_liquidity` / `claim_pool` (against their own
+signer-bound `LiquidityPosition`), `buy`, `sell`, `redeem` / `redeem_scalar`,
+`redeem_void`, `finalize_outcome` (crank), and `void_stale` (crank). Permissionless
+cranking of finalize/void is a feature: it removes liveness dependence on any
+single actor. Anyone can become an LP via `add_liquidity`; the share ledger
+(`LiquidityPosition` + `market.total_shares`) and floor/ceil rounding (§5) ensure
+no LP is over- or under-credited.
 
 ## 2. Settlement defenses (defense in depth)
 
@@ -195,14 +204,25 @@ MVP for a finished oracle-backed protocol.
   `PriceFeed` (the documented integration boundary); it does not parse Switchboard's
   native account.
 
+**Also now addressed:**
+
+- **Scalar / range markets exist.** Markets may set `market_kind = SCALAR` over a
+  range `[lower_bound, upper_bound]`, reusing the binary FPMM with YES=LONG /
+  NO=SHORT. Settlement runs the **same** trusted/oracle propose→timelock→finalize
+  path (`propose_scalar` or the scalar branch of `propose_from_oracle`); finalize
+  maps the proposed value to a fraction `f`, and `redeem_scalar` pays LONG `f` /
+  SHORT `1 − f` (floored, so conservation holds). The research-designated flagship
+  (a scalar GPU-price market) is now expressible — though, like binary settlement,
+  it inherits the same residual trust in the proposed value.
+- **Multi-LP liquidity exists.** Any number of providers can `add_liquidity` /
+  `remove_liquidity` against a real per-(market, owner) `LiquidityPosition` share
+  ledger (`market.total_shares`); `claim_pool` pays each LP their pro-rata slice.
+  Adds preserve the price ratio and all share/slice rounding favors the pool /
+  existing LPs (see §5). **Still future:** routing a configurable fraction of taker
+  fees to LPs pro-rata (fees remain a separate admin bucket).
+
 **Hard non-goals:**
 
-- **No scalar / range markets.** Binary YES/NO only. The research-designated
-  flagship (a scalar GPU-price market) cannot yet be expressed.
-- **Single-seed liquidity.** One LP per market (`lp` / `lp_shares` is the
-  creator's single seed); no `add_liquidity` / `remove_liquidity`, no
-  multi-LP share ledger, no fee share to LPs. The LP's seed is one-sided at-risk
-  capital until settlement.
 - **Guardian can only void, not correct.** A wrong outcome can be neutralized
   (50/50 refund) but not fixed to the true outcome on-chain.
 - **No Asian-VWAP / time-averaged settlement accumulator.** Resolution is a
@@ -216,10 +236,12 @@ The program's safety rests on these, asserted by unit/property tests
 (`math.rs`) and the integration suite:
 
 - **Conservation.** `vault balance == market.collateral + market.fee_accrued` at
-  all times. Outcome tokens are minted/burned only as full sets, so
+  all times. Outcome tokens are minted/burned only as full sets (including the
+  full set minted/sent-back on `add_liquidity`), so
   `yes_supply == no_supply == market.collateral` while trading. Settlement
-  conserves: RESOLVED pays winners 1:1 against `collateral`; VOID pays half per
-  token (`amount / 2`, rounded down), which never over-pays the vault.
+  conserves: binary RESOLVED pays winners 1:1 against `collateral`; scalar RESOLVED
+  pays LONG `f` + SHORT `1 − f` (floored, so `long + short <= amount`); VOID pays
+  half per token (`amount / 2`, rounded down) — none over-pays the vault.
 - **Constant product never decreases (`k` non-decrease).** Every trade satisfies
   `r_yes' · r_no' >= r_yes · r_no`. Value cannot be extracted from the pool by
   repeated trading (round-trip non-profitability is property-tested).
@@ -227,6 +249,17 @@ The program's safety rests on these, asserted by unit/property tests
   traders receive slightly fewer tokens on a buy and pay slightly more on a sell.
   This is the mechanism behind `k` non-decrease and is asserted directly,
   including ceil-tightness and no-underflow of `keep`/`need`.
+- **LP-share rounding extracts no value.** Multi-LP add/remove shares and every
+  pro-rata reserve slice round the same way — **floors** for shares minted and for
+  each provider's slice (the entrant/remover is never over-credited), **ceil** for
+  the reserve the pool keeps on an add (the send-back is the smaller value). So an
+  LP cannot profit by adding then immediately removing, and a remover/claimer never
+  pulls more than their fair fraction — leftover dust stays with the remaining LPs.
+  This is property-tested (`lp_add_rounding_favors_pool`,
+  `lp_add_then_remove_no_profit`, `lp_slices_never_over_pool`) and exercised by the
+  add-then-remove integration test. Scalar settlement uses the same floor-rounded
+  `scalar_payout` (LONG `f`, SHORT `1 − f`), so `long + short <= amount` and the
+  vault is never overpaid.
 - **Checked arithmetic throughout.** All payout/accounting math uses checked
   ops; overflow fails closed with `MathOverflow`. The `u64` truncation in
   `quote_buy` is the fundamental SPL supply ceiling and fails closed, not a leak.

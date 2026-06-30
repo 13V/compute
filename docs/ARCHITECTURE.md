@@ -19,7 +19,7 @@ known limitations see [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 | Component | Path | Role |
 |---|---|---|
-| **Anchor program** | `programs/compute-markets/` | The on-chain protocol: 21 instructions, the `Config`, `Market`, and `PriceFeed` accounts, the FPMM trade math, the settlement state machine (trusted-key **and** oracle-feed resolution), custody of collateral in PDA vaults. The load-bearing security surface. |
+| **Anchor program** | `programs/compute-markets/` | The on-chain protocol: 25 instructions, the `Config`, `Market`, `LiquidityPosition`, and `PriceFeed` accounts, the FPMM trade math, the settlement state machine (trusted-key **and** oracle-feed resolution; binary **and** scalar markets), multi-LP liquidity, custody of collateral in PDA vaults. The load-bearing security surface. |
 | **FPMM math** | `programs/compute-markets/src/math.rs` | Pure, dependency-free arithmetic for buy/sell quotes, fees, and marginal price. No Solana/Anchor types, so it is exhaustively unit- and property-tested on the host. All economically load-bearing rounding lives here. |
 | **TypeScript SDK** | `sdk/` | PDA derivation, off-chain AMM quote helpers, a typed Anchor client, and the vendored IDL (`sdk/idl/`). |
 | **Web app** | `app/` | Next.js frontend: wallet connect, trade/redeem flows. Ships its own vendored IDL copy (`app/lib/idl/`). |
@@ -104,23 +104,95 @@ Marginal price (probability) of an outcome is `other_reserve / (self_reserve +
 other_reserve)`, scaled by 1e6 (`marginal_price_micro`); buying a side raises its
 price.
 
+### 2.5 Market types (binary vs scalar)
+
+`market.market_kind` selects the payout shape; **trading is identical** for both.
+
+- **Binary** (`MARKET_BINARY = 0`, the default): YES (`0`) and NO (`1`) each
+  redeem 1:1 for collateral if they win; the loser is worthless.
+- **Scalar / range** (`MARKET_SCALAR = 1`): the *same* binary FPMM, reinterpreted
+  with **YES = LONG** and **NO = SHORT** over a numeric range `[lower_bound,
+  upper_bound]` (`A < B`, set at `create_market`). A full set is still always worth
+  exactly 1 collateral, so split/merge conservation is exact and unchanged.
+
+Scalar settlement maps a resolved value to a **fraction** `f ∈ [0, 1]` (stored as
+`settlement_fraction`, scaled to `PRICE_SCALE = 1e6`):
+
+```text
+f = clamp(value, A, B) − A) / (B − A)        # scalar_fraction(value, A, B)
+LONG  (YES) token pays  amount · f / 1e6     # scalar_payout(amount, f, true)
+SHORT (NO)  token pays  amount · (1e6 − f) / 1e6   # scalar_payout(amount, f, false)
+```
+
+Both payouts **floor**, so `long_payout + short_payout <= amount` and the vault is
+never overpaid — the scalar analogue of the binary conservation property. The
+resolution path is the *same* trusted/oracle, propose→timelock→finalize machine:
+a scalar outcome is proposed by `propose_scalar(value)` (trusted) or the scalar
+branch of `propose_from_oracle` (which records the raw feed value); both store
+`proposed_value`, and `finalize_outcome` computes `settlement_fraction` from it.
+Scalar holders settle with `redeem_scalar` (binary `redeem`/`propose_outcome` are
+guarded to `MARKET_BINARY` and revert `WrongMarketKind` on a scalar market, and
+vice-versa).
+
+### 2.6 Liquidity provision (multi-LP shares)
+
+Liquidity follows the Gnosis FPMM `addFunding` / `removeFunding` design. Each
+provider's stake is tracked by a per-(market, owner) **`LiquidityPosition`** PDA
+(`["lp", market, owner]`, signer-bound); `market.total_shares` is the sum of all
+positions, and a provider owns `shares / total_shares` of the reserves.
+
+- **`seed_liquidity`** (creator, once) sets `total_shares = amount` and creates the
+  creator's position holding 100% of the shares.
+- **`add_liquidity(amount)`** mints a full set (`amount` of each outcome) into the
+  pool, then **keeps** `ceil(amount · reserve_i / weight)` per side and **sends the
+  rest back** to the LP, where `weight = max(reserve_yes, reserve_no)`. Keeping a
+  ceiled slice of each side and returning the surplus **preserves the price ratio**
+  (the reserves grow proportionally), so existing holders are not repriced. It
+  mints `floor(amount · total_shares / weight)` new shares into the caller's
+  position (a dust add that rounds to 0 shares is rejected). The position account
+  is created on first add via Anchor's **`init-if-needed`** feature.
+- **`remove_liquidity(shares)`** (pre-settlement) burns `shares` of the caller's
+  position and returns `floor(reserve_i · shares / total_shares)` of **each**
+  outcome token to the LP. Collateral is unchanged — the outcome tokens simply
+  leave the pool to the provider, who can later merge equal YES+NO or hold to
+  settlement.
+- **`claim_pool`** (post-settlement) is now **per-LP pro-rata**: the caller claims
+  their whole position's slice `floor(reserve_i · shares / total_shares)` of each
+  reserve, paid out per market kind — binary winning slice 1:1, scalar LONG slice
+  at `f` plus SHORT slice at `1 − f`, void half of each slice — then zeroes the
+  position.
+
+**Rounding always favors the pool / existing LPs.** Shares minted and every slice
+are **floored** (the entrant/remover is never over-credited); the reserve the pool
+keeps on an add is **ceiled** (the send-back is the smaller value). No LP can
+extract value by adding then immediately removing — this is property-tested
+(`lp_add_then_remove_no_profit`, `lp_slices_never_over_pool`,
+`lp_add_rounding_favors_pool`) and exercised end-to-end by the add-then-remove
+integration test.
+
 ## 3. Account model
 
-Three account types, all Anchor-owned:
+Four account types, all Anchor-owned:
 
 - **`Config`** — one per deployment. Holds `admin`, `pending_admin`, `guardian`,
   the `collateral_mint`, `fee_bps`, `dispute_period`, a monotonic `market_count`,
   the global `paused` flag, and the PDA bump.
 - **`Market`** — one per market. Holds identity (`market_id`, `creator`,
-  `resolver`, `resolver_kind`), the **oracle config** (`oracle_feed`,
-  `oracle_strike`, `oracle_comparison`, `oracle_max_staleness`, used when
-  `resolver_kind == ORACLE_FEED`), the token wiring (`collateral_mint`, `yes_mint`,
-  `no_mint`, `vault`, `pool_yes`, `pool_no`), the AMM state (`reserve_yes`,
-  `reserve_no`, `lp`, `lp_shares`), the accounting (`collateral`, `fee_accrued`),
-  the lifecycle (`state`, `outcome`, `proposed_outcome`, `close_time`,
+  `resolver`, `resolver_kind`), the **market-kind config** (`market_kind`,
+  `lower_bound`, `upper_bound`, `proposed_value`, `settlement_fraction`, used for
+  scalar markets), the **oracle config** (`oracle_feed`, `oracle_strike`,
+  `oracle_comparison`, `oracle_max_staleness`, used when `resolver_kind ==
+  ORACLE_FEED`), the token wiring (`collateral_mint`, `yes_mint`, `no_mint`,
+  `vault`, `pool_yes`, `pool_no`), the AMM state (`reserve_yes`, `reserve_no`,
+  `lp`, `total_shares`), the accounting (`collateral`, `fee_accrued`), the
+  lifecycle (`state`, `outcome`, `proposed_outcome`, `close_time`,
   `resolution_time`, `resolved_at`), the display strings (`question`,
-  `resolution_source`), and **64 reserved bytes** of forward-compat padding for
-  future oracle resolver configs.
+  `resolution_source`), and **64 reserved bytes** of forward-compat padding.
+- **`LiquidityPosition`** — one per (market, provider). A PDA
+  (`["lp", market, owner]`) holding `market`, `owner`, `shares`, and a bump.
+  `shares / market.total_shares` is the provider's fraction of the reserves.
+  Created at `seed_liquidity` (creator, 100%) or first `add_liquidity`; drained by
+  `claim_pool`. Signer-bound to `owner`.
 - **`PriceFeed`** — a generic on-chain numeric feed (not a PDA; a fresh
   keypair-owned account). Holds `authority`, `value`, `decimals`, `published_at`,
   and a `description`. Read by `RESOLVER_ORACLE_FEED` markets to resolve; posted to
@@ -158,9 +230,12 @@ u64**; `market` below means the Market account's own pubkey.
 | `vault` | `["vault", market]` | Token account holding collateral; authority = Market PDA. |
 | `pool_yes` | `["pool_yes", market]` | AMM reserve of YES tokens; authority = Market PDA. |
 | `pool_no` | `["pool_no", market]` | AMM reserve of NO tokens; authority = Market PDA. |
+| `LiquidityPosition` | `["lp", market, owner]` | One per provider; tracks `shares` of `market.total_shares`. Signer-bound to `owner`. |
 
 The `vault`/`yes_mint`/`no_mint` are created at `create_market`; the
-`pool_yes`/`pool_no` are created at `seed_liquidity`.
+`pool_yes`/`pool_no` and the creator's `LiquidityPosition` are created at
+`seed_liquidity`; further provider positions are created on their first
+`add_liquidity` (Anchor `init-if-needed`).
 
 ## 4. Resolution state machine
 
@@ -246,12 +321,15 @@ reconcile balances from these alone:
 |---|---|---|
 | `MarketCreated` | `create_market` | `market_id`, `market`, `creator`, `resolver`, `close_time`, `resolution_time` |
 | `LiquiditySeeded` | `seed_liquidity` | `market`, `amount` |
+| `LiquidityAdded` | `add_liquidity` | `market`, `provider`, `amount`, `shares_minted` |
+| `LiquidityRemoved` | `remove_liquidity` | `market`, `provider`, `shares`, `yes_out`, `no_out` |
 | `TradeExecuted` | `buy` / `sell` | `market`, `user`, `is_buy`, `outcome`, `collateral` (gross), `tokens` |
 | `OutcomeProposed` | `propose_outcome` / `propose_from_oracle` | `market`, `resolver` (the feed pubkey on the oracle path), `outcome`, `proposed_at` |
-| `MarketResolved` | `finalize_outcome` | `market`, `outcome`, `resolved_at` (finalize time) |
+| `ScalarProposed` | `propose_scalar` | `market`, `resolver`, `value`, `proposed_at` |
+| `MarketResolved` | `finalize_outcome` | `market`, `outcome`, `settlement_fraction` (scalar `f`; `0` for binary), `resolved_at` (finalize time) |
 | `MarketVoided` | `dispute_void` / `void_stale` | `market`, `reason` (`0 = DISPUTE`, `1 = STALE`) |
-| `Redeemed` | `redeem` / `redeem_void` | `market`, `user`, `amount` (tokens burned), `payout` (collateral out) |
-| `PoolClaimed` | `claim_pool` | `market`, `lp`, `payout` |
+| `Redeemed` | `redeem` / `redeem_scalar` / `redeem_void` | `market`, `user`, `amount` (tokens burned), `payout` (collateral out) |
+| `PoolClaimed` | `claim_pool` | `market`, `lp` (caller), `provider` (position owner), `payout` |
 | `FeesCollected` | `collect_fees` | `market`, `amount` |
 | `PausedSet` | `set_paused` | `paused` |
 | `PriceFeedInitialized` | `init_price_feed` | `feed`, `authority` |
@@ -267,5 +345,9 @@ Notes for indexers:
 - A market reaching `MarketVoided` after `OutcomeProposed` is a guardian veto;
   one reaching it from `OPEN` with `reason = STALE` is the liveness hatch.
 - To track the conservation invariant off-chain, sum `TradeExecuted` deltas plus
-  `LiquiditySeeded`, `Redeemed.payout`, `PoolClaimed.payout`, and
-  `FeesCollected.amount` against the vault balance.
+  `LiquiditySeeded`, `LiquidityAdded.amount`, `Redeemed.payout`,
+  `PoolClaimed.payout`, and `FeesCollected.amount` against the vault balance.
+  (`LiquidityRemoved` moves only outcome tokens, so it does not change collateral.)
+- `MarketResolved.settlement_fraction` is the scalar payout fraction (`0` for
+  binary); `PoolClaimed.provider` is the LP whose position was drained (the `lp`
+  field is the caller, identical here since the position is signer-bound).

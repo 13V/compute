@@ -23,17 +23,25 @@ web app) where users connect a wallet and trade YES/NO on compute-related outcom
 
 ## How it works (mechanism)
 
-Each market is **binary (YES / NO)** and uses a **fixed-product market maker (FPMM)**, the
-Gnosis/Polymarket design: collateral (USDC, 6 decimals) is split into full sets of outcome
-tokens, and a constant-product pool prices YES vs NO. Traders get continuous, always-on
-pricing rather than waiting for a counterparty.
+A market is **binary (YES / NO)** or **scalar / range** and uses a **fixed-product market
+maker (FPMM)**, the Gnosis/Polymarket design: collateral (USDC, 6 decimals) is split into full
+sets of outcome tokens, and a constant-product pool prices the two sides. Traders get
+continuous, always-on pricing rather than waiting for a counterparty.
 
 - **Buy** invests collateral → mints a full set into the pool → the constant-product swap
   returns the bought outcome to the trader.
 - **Sell** returns outcome tokens → the pool merges a full set out → pays collateral.
-- **Resolve** is **two steps**: the market's `resolver` *proposes* an outcome, then —
-  after a dispute window — anyone *finalizes* it.
-- **Redeem** burns winning tokens 1:1 for collateral. The losing side is worthless.
+- **Liquidity is multi-LP.** Anyone can `add_liquidity` (mints a full set, keeps a
+  price-ratio-preserving slice, mints pro-rata shares into a per-provider `LiquidityPosition`)
+  or `remove_liquidity`; shares track each LP's claim on the reserves, and all rounding favors
+  the pool / existing LPs.
+- **Scalar / range markets** reuse the same FPMM with **YES = LONG, NO = SHORT** over a range
+  `[lower, upper]`; a full set is still always worth 1 collateral. Settlement maps the resolved
+  value to a fraction `f` and pays LONG `f` / SHORT `1 − f` (`redeem_scalar`).
+- **Resolve** is **two steps**: the market's `resolver` *proposes* an outcome (`propose_outcome`
+  binary / `propose_scalar` scalar), then — after a dispute window — anyone *finalizes* it.
+- **Redeem** burns winning binary tokens 1:1 for collateral (losing side worthless), or scalar
+  tokens at their settled fraction.
 
 All rounding favors the pool, so the constant product never decreases — proven by a
 property test. The program tracks a conservation invariant asserted throughout the
@@ -76,10 +84,11 @@ A manual resolver is a trusted component, so settlement is defended in depth:
   resolvers (native Switchboard-account parsing / Pyth / optimistic) without a layout-breaking
   change — those are not yet wired.
 
-### Instructions (21)
+### Instructions (25)
 
-`initialize` · `create_market` · `seed_liquidity` · `buy` · `sell` · `propose_outcome` ·
-`propose_from_oracle` · `finalize_outcome` · `dispute_void` · `void_stale` · `redeem` ·
+`initialize` · `create_market` · `seed_liquidity` · `add_liquidity` · `remove_liquidity` ·
+`buy` · `sell` · `propose_outcome` · `propose_scalar` · `propose_from_oracle` ·
+`finalize_outcome` · `dispute_void` · `void_stale` · `redeem` · `redeem_scalar` ·
 `redeem_void` · `claim_pool` · `collect_fees` · `init_price_feed` · `publish_price` ·
 `set_paused` · `set_fee_bps` · `set_guardian` · `set_admin` · `accept_admin`.
 
@@ -158,14 +167,16 @@ upgrade-authority custody via a Squads multisig) is in
 
 ## MVP scope & limitations
 
-This MVP is intentionally focused: **binary** markets, FPMM trading, **single-seed**
-liquidity, and a **trusted resolver key by default** (defended in depth). Settlement now also
+This MVP now supports **binary and scalar/range** markets, FPMM trading, **multi-LP
+liquidity** (per-provider share ledger, `add_liquidity` / `remove_liquidity`, per-LP
+`claim_pool`), and a **trusted resolver key by default** (defended in depth). Settlement also
 offers an **oracle feed-bridge adapter**: markets can resolve from an on-chain `PriceFeed`
 posted to by a Switchboard On-Demand Function or a committee multisig, still passing through the
 dispute window + guardian veto (see [`docs/ORACLE.md`](docs/ORACLE.md)) — but the trusted key
 remains the default and the residual trust shifts to the feed authority rather than disappearing.
-Known non-goals today: native Switchboard-account parsing / Pyth / optimistic resolvers remain
-future, no scalar/range markets, no multi-LP shares, and the guardian can only *void* a bad
-proposal (50/50 refund), not correct it. The load-bearing next steps are **hardening the oracle
-layer** and **scalar/range markets** — see [`docs/RESEARCH.md`](docs/RESEARCH.md) and
-[`docs/WORLDCLASS.md`](docs/WORLDCLASS.md). **Not audited; do not use with real funds.**
+Known non-goals today: native Switchboard-account parsing / Pyth / a Solana-native optimistic
+oracle remain future, taker fees are **not yet routed to LPs** (fees stay a separate admin
+bucket), and the guardian can only *void* a bad proposal (50/50 refund), not correct it. The
+load-bearing next steps are **hardening the oracle layer** and **fee-to-LP routing** — see
+[`docs/RESEARCH.md`](docs/RESEARCH.md) and [`docs/WORLDCLASS.md`](docs/WORLDCLASS.md).
+**Not audited; do not use with real funds.**
