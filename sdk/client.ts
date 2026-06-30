@@ -15,7 +15,13 @@ import {
 
 import { ComputeMarkets } from "./idl/compute_markets";
 import idl from "./idl/compute_markets.json";
-import { configPda, deriveMarketAccounts, marketPda, OUTCOME_YES } from "./pdas";
+import {
+  configPda,
+  deriveMarketAccounts,
+  marketPda,
+  OUTCOME_YES,
+  MARKET_BINARY,
+} from "./pdas";
 
 export * from "./pdas";
 export * from "./amm";
@@ -37,6 +43,11 @@ export interface CreateMarketParams {
   oracleStrike?: BN;
   oracleComparison?: number;
   oracleMaxStaleness?: BN;
+  /** Market kind: MARKET_BINARY (0, default) or MARKET_SCALAR (1). */
+  marketKind?: number;
+  /** Scalar range (required when marketKind === MARKET_SCALAR; ignored for binary). */
+  lowerBound?: BN;
+  upperBound?: BN;
 }
 
 /**
@@ -120,7 +131,10 @@ export class ComputeClient {
         params.oracleFeed ?? PublicKey.default,
         params.oracleStrike ?? new BN(0),
         params.oracleComparison ?? 0,
-        params.oracleMaxStaleness ?? new BN(0)
+        params.oracleMaxStaleness ?? new BN(0),
+        params.marketKind ?? MARKET_BINARY,
+        params.lowerBound ?? new BN(0),
+        params.upperBound ?? new BN(0)
       )
       .accountsPartial({
         config,
@@ -230,6 +244,15 @@ export class ComputeClient {
       .instruction();
   }
 
+  /** Propose a settlement `value` for a SCALAR market (trusted resolver only). */
+  async proposeScalarIx(resolver: PublicKey, marketId: number | BN, value: BN) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    return this.program.methods
+      .proposeScalar(value)
+      .accountsPartial({ market: a.market, resolver })
+      .instruction();
+  }
+
   // ----- oracle feed -----
 
   async fetchPriceFeed(feed: PublicKey) {
@@ -315,6 +338,20 @@ export class ComputeClient {
     const mint = side === OUTCOME_YES ? a.yesMint : a.noMint;
     return this.program.methods
       .redeemVoid(amount)
+      .accountsPartial(this.redeemAccounts(user, marketId, mint, collateralMint))
+      .instruction();
+  }
+
+  /**
+   * Redeem a SCALAR market position. `side` picks LONG (OUTCOME_YES => yes_mint)
+   * or SHORT (OUTCOME_NO => no_mint); the payout is computed on-chain from the
+   * settled fraction.
+   */
+  async redeemScalarIx(user: PublicKey, marketId: number | BN, side: number, amount: BN, collateralMint: PublicKey) {
+    const a = deriveMarketAccounts(marketId, this.programId);
+    const mint = side === OUTCOME_YES ? a.yesMint : a.noMint;
+    return this.program.methods
+      .redeemScalar(amount)
       .accountsPartial(this.redeemAccounts(user, marketId, mint, collateralMint))
       .instruction();
   }

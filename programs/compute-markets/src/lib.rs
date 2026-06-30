@@ -47,6 +47,17 @@ pub const OUTCOME_YES: u8 = 0;
 /// NO outcome index.
 pub const OUTCOME_NO: u8 = 1;
 
+/// Binary market: a YES/NO question; the winning side redeems 1:1.
+pub const MARKET_BINARY: u8 = 0;
+/// Scalar / range market: reuses the binary FPMM with YES=LONG, NO=SHORT. A full
+/// set (1 LONG + 1 SHORT) is always worth 1 collateral. At settlement a fraction
+/// `f` in `[0, 1]` (scaled by [`math::PRICE_SCALE`]) determines payouts: LONG
+/// settles at `f`, SHORT at `1 - f`. See [`math::scalar_fraction`].
+pub const MARKET_SCALAR: u8 = 1;
+
+/// Fixed-point scale for scalar settlement fractions (re-exported from [`math`]).
+pub const PRICE_SCALE: u64 = math::PRICE_SCALE;
+
 /// Open for trading.
 pub const STATE_OPEN: u8 = 0;
 /// An outcome has been proposed and is in the dispute window.
@@ -148,6 +159,9 @@ pub mod compute_markets {
         oracle_strike: i64,
         oracle_comparison: u8,
         oracle_max_staleness: i64,
+        market_kind: u8,
+        lower_bound: i64,
+        upper_bound: i64,
     ) -> Result<()> {
         require!(
             question.len() <= Market::MAX_QUESTION,
@@ -175,6 +189,17 @@ pub mod compute_markets {
             _ => return err!(ErrorCode::UnsupportedResolverKind),
         }
 
+        // Scalar markets need a non-degenerate range; binary markets ignore the
+        // bounds (stored as 0).
+        let (stored_lower, stored_upper) = match market_kind {
+            MARKET_BINARY => (0i64, 0i64),
+            MARKET_SCALAR => {
+                require!(lower_bound < upper_bound, ErrorCode::InvalidScalarRange);
+                (lower_bound, upper_bound)
+            }
+            _ => return err!(ErrorCode::UnsupportedMarketKind),
+        };
+
         let now = Clock::get()?.unix_timestamp;
         require!(close_time <= resolution_time, ErrorCode::InvalidTimeWindow);
         require!(resolution_time > now, ErrorCode::InvalidTimeWindow);
@@ -189,6 +214,11 @@ pub mod compute_markets {
         market.creator = ctx.accounts.creator.key();
         market.resolver = resolver;
         market.resolver_kind = resolver_kind;
+        market.market_kind = market_kind;
+        market.lower_bound = stored_lower;
+        market.upper_bound = stored_upper;
+        market.proposed_value = 0;
+        market.settlement_fraction = 0;
         market.oracle_feed = oracle_feed;
         market.oracle_strike = oracle_strike;
         market.oracle_comparison = oracle_comparison;
@@ -570,6 +600,10 @@ pub mod compute_markets {
         let _ = Side::from_u8(outcome)?;
         let market = &mut ctx.accounts.market;
         require!(
+            market.market_kind == MARKET_BINARY,
+            ErrorCode::WrongMarketKind
+        );
+        require!(
             market.resolver_kind == RESOLVER_TRUSTED_KEY,
             ErrorCode::WrongResolverKind
         );
@@ -589,6 +623,41 @@ pub mod compute_markets {
             market: market.key(),
             resolver: ctx.accounts.resolver.key(),
             outcome,
+            proposed_at: now,
+        });
+        Ok(())
+    }
+
+    /// Step 1 of resolution for a SCALAR market: the market's `resolver` proposes
+    /// a settlement `value` at/after `resolution_time`. Mirrors `propose_outcome`
+    /// but records a raw scalar value (mapped to a fraction at finalize) instead
+    /// of a YES/NO outcome. Opens the same dispute window; payouts stay locked.
+    pub fn propose_scalar(ctx: Context<ProposeOutcome>, value: i64) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.market_kind == MARKET_SCALAR,
+            ErrorCode::WrongMarketKind
+        );
+        require!(
+            market.resolver_kind == RESOLVER_TRUSTED_KEY,
+            ErrorCode::WrongResolverKind
+        );
+        require!(market.state == STATE_OPEN, ErrorCode::MarketNotOpen);
+        require!(
+            ctx.accounts.resolver.key() == market.resolver,
+            ErrorCode::Unauthorized
+        );
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= market.resolution_time, ErrorCode::TooEarlyToResolve);
+
+        market.state = STATE_RESOLVING;
+        market.proposed_value = value;
+        market.resolved_at = now;
+
+        emit!(ScalarProposed {
+            market: market.key(),
+            resolver: ctx.accounts.resolver.key(),
+            value,
             proposed_at: now,
         });
         Ok(())
@@ -664,21 +733,41 @@ pub mod compute_markets {
             ErrorCode::StaleFeed
         );
 
-        let is_yes =
-            math::oracle_is_yes(feed_value, market.oracle_strike, market.oracle_comparison)
-                .ok_or(ErrorCode::InvalidComparison)?;
-        let outcome = if is_yes { OUTCOME_YES } else { OUTCOME_NO };
+        match market.market_kind {
+            MARKET_BINARY => {
+                // Binary: compare the feed value to the strike.
+                let is_yes =
+                    math::oracle_is_yes(feed_value, market.oracle_strike, market.oracle_comparison)
+                        .ok_or(ErrorCode::InvalidComparison)?;
+                let outcome = if is_yes { OUTCOME_YES } else { OUTCOME_NO };
 
-        market.state = STATE_RESOLVING;
-        market.proposed_outcome = outcome;
-        market.resolved_at = now;
+                market.state = STATE_RESOLVING;
+                market.proposed_outcome = outcome;
+                market.resolved_at = now;
 
-        emit!(OutcomeProposed {
-            market: market.key(),
-            resolver: feed_key,
-            outcome,
-            proposed_at: now,
-        });
+                emit!(OutcomeProposed {
+                    market: market.key(),
+                    resolver: feed_key,
+                    outcome,
+                    proposed_at: now,
+                });
+            }
+            MARKET_SCALAR => {
+                // Scalar: settle on the raw feed value (mapped through the bounds
+                // at finalize); no strike comparison.
+                market.state = STATE_RESOLVING;
+                market.proposed_value = feed_value;
+                market.resolved_at = now;
+
+                emit!(ScalarProposed {
+                    market: market.key(),
+                    resolver: feed_key,
+                    value: feed_value,
+                    proposed_at: now,
+                });
+            }
+            _ => return err!(ErrorCode::UnsupportedMarketKind),
+        }
         Ok(())
     }
 
@@ -698,11 +787,27 @@ pub mod compute_markets {
         );
 
         market.state = STATE_RESOLVED;
-        market.outcome = market.proposed_outcome;
+        match market.market_kind {
+            MARKET_BINARY => {
+                market.outcome = market.proposed_outcome;
+            }
+            MARKET_SCALAR => {
+                // Map the proposed value through the bounds into a settlement
+                // fraction; `outcome` stays 0 (unused for scalar redemption).
+                market.settlement_fraction = math::scalar_fraction(
+                    market.proposed_value,
+                    market.lower_bound,
+                    market.upper_bound,
+                )
+                .ok_or(ErrorCode::InvalidScalarRange)?;
+            }
+            _ => return err!(ErrorCode::UnsupportedMarketKind),
+        }
 
         emit!(MarketResolved {
             market: market.key(),
             outcome: market.outcome,
+            settlement_fraction: market.settlement_fraction,
             resolved_at: now,
         });
         Ok(())
@@ -761,6 +866,10 @@ pub mod compute_markets {
     pub fn redeem(ctx: Context<Redeem>, amount: u64) -> Result<()> {
         require!(amount > 0, ErrorCode::ZeroAmount);
         let market = &mut ctx.accounts.market;
+        require!(
+            market.market_kind == MARKET_BINARY,
+            ErrorCode::WrongMarketKind
+        );
         require!(market.state == STATE_RESOLVED, ErrorCode::NotResolved);
 
         let winning_mint = market.outcome_mint(Side::from_u8(market.outcome)?);
@@ -895,6 +1004,87 @@ pub mod compute_markets {
         Ok(())
     }
 
+    /// Redeem `amount` of a SCALAR market's LONG (yes_mint) or SHORT (no_mint)
+    /// token for its settled value. `is_long` is inferred from which of the two
+    /// mints the user's outcome ATA holds; the payout is
+    /// `scalar_payout(amount, settlement_fraction, is_long)` (floor-rounded so the
+    /// vault is never overpaid).
+    pub fn redeem_scalar(ctx: Context<Redeem>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.market_kind == MARKET_SCALAR,
+            ErrorCode::WrongMarketKind
+        );
+        require!(market.state == STATE_RESOLVED, ErrorCode::NotResolved);
+
+        // The redeemed side is whichever mint the user holds: yes_mint => LONG,
+        // no_mint => SHORT.
+        let mint = ctx.accounts.winning_mint.key();
+        let is_long = if mint == market.yes_mint {
+            true
+        } else if mint == market.no_mint {
+            false
+        } else {
+            return err!(ErrorCode::WrongMint);
+        };
+        require_keys_eq!(ctx.accounts.user_outcome.mint, mint, ErrorCode::WrongMint);
+        require_keys_eq!(
+            ctx.accounts.user_outcome.owner,
+            ctx.accounts.user.key(),
+            ErrorCode::WrongOwner
+        );
+
+        let payout = math::scalar_payout(amount, market.settlement_fraction, is_long);
+        require!(
+            payout <= market.collateral,
+            ErrorCode::InsufficientLiquidity
+        );
+
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.winning_mint.to_account_info(),
+                    from: ctx.accounts.user_outcome.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+
+        if payout > 0 {
+            let id_bytes = market.market_id.to_le_bytes();
+            let bump_seed = [market.bump];
+            let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
+            let signer: &[&[&[u8]]] = &[seeds];
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault.to_account_info(),
+                        to: ctx.accounts.user_collateral.to_account_info(),
+                        authority: market.to_account_info(),
+                    },
+                    signer,
+                ),
+                payout,
+            )?;
+            market.collateral = market
+                .collateral
+                .checked_sub(payout)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
+
+        emit!(Redeemed {
+            market: market.key(),
+            user: ctx.accounts.user.key(),
+            amount,
+            payout,
+        });
+        Ok(())
+    }
+
     /// After settlement, the LP reclaims the pool's outcome tokens as collateral:
     /// the winning-side reserve on a YES/NO resolution, or half of each reserve on
     /// a void.
@@ -921,8 +1111,50 @@ pub mod compute_markets {
         let seeds: &[&[u8]] = &[MARKET_SEED, id_bytes.as_ref(), bump_seed.as_ref()];
         let signer: &[&[&[u8]]] = &[seeds];
 
-        let payout: u64 = if market.state == STATE_RESOLVED {
-            // Winning-side reserve redeems 1:1; the losing-side pool tokens are worthless.
+        let payout: u64 = if market.state == STATE_RESOLVED && market.market_kind == MARKET_SCALAR {
+            // Scalar: the pool holds `reserve_yes` LONG and `reserve_no` SHORT,
+            // each settling at the resolved fraction (LONG at f, SHORT at 1 - f).
+            let ry = market.reserve_yes;
+            let rn = market.reserve_no;
+            require!(ry > 0 || rn > 0, ErrorCode::NothingToClaim);
+            let f = market.settlement_fraction;
+            let lp_payout = math::scalar_payout(ry, f, true)
+                .checked_add(math::scalar_payout(rn, f, false))
+                .ok_or(ErrorCode::MathOverflow)?;
+            if ry > 0 {
+                token::burn(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Burn {
+                            mint: ctx.accounts.yes_mint.to_account_info(),
+                            from: ctx.accounts.pool_yes.to_account_info(),
+                            authority: market.to_account_info(),
+                        },
+                        signer,
+                    ),
+                    ry,
+                )?;
+            }
+            if rn > 0 {
+                token::burn(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Burn {
+                            mint: ctx.accounts.no_mint.to_account_info(),
+                            from: ctx.accounts.pool_no.to_account_info(),
+                            authority: market.to_account_info(),
+                        },
+                        signer,
+                    ),
+                    rn,
+                )?;
+            }
+            market.reserve_yes = 0;
+            market.reserve_no = 0;
+            lp_payout
+        } else if market.state == STATE_RESOLVED {
+            // Binary: the winning-side reserve redeems 1:1; the losing-side pool
+            // tokens are worthless.
             let side = Side::from_u8(market.outcome)?;
             let (winning_reserve, winning_pool, winning_mint) = match side {
                 Side::Yes => (
@@ -1136,6 +1368,20 @@ pub struct Market {
     pub creator: Pubkey,
     pub resolver: Pubkey,
     pub resolver_kind: u8,
+    /// `MARKET_BINARY` or `MARKET_SCALAR`. Scalar markets reuse the binary FPMM
+    /// (YES=LONG, NO=SHORT) and differ only in resolution + redemption.
+    pub market_kind: u8,
+    /// Scalar range `[lower_bound, upper_bound]` (used when `market_kind ==
+    /// MARKET_SCALAR`; both 0 for binary). Settlement clamps the resolved value
+    /// to this range and maps it to a fraction in `[0, PRICE_SCALE]`.
+    pub lower_bound: i64,
+    pub upper_bound: i64,
+    /// Proposed scalar settlement value (parallels `proposed_outcome`). Set by
+    /// `propose_scalar` / `propose_from_oracle` for scalar markets.
+    pub proposed_value: i64,
+    /// Resolved settlement fraction `f` scaled to `PRICE_SCALE`, in
+    /// `[0, PRICE_SCALE]`. Set at `finalize_outcome` for scalar markets.
+    pub settlement_fraction: u32,
     /// Oracle config (used when `resolver_kind == RESOLVER_ORACLE_FEED`).
     pub oracle_feed: Pubkey,
     pub oracle_strike: i64,
@@ -1176,6 +1422,11 @@ impl Market {
         + 32 // creator
         + 32 // resolver
         + 1  // resolver_kind
+        + 1  // market_kind
+        + 8  // lower_bound
+        + 8  // upper_bound
+        + 8  // proposed_value
+        + 4  // settlement_fraction
         + 32 // oracle_feed
         + 8  // oracle_strike
         + 1  // oracle_comparison
@@ -1560,7 +1811,17 @@ pub struct OutcomeProposed {
 pub struct MarketResolved {
     pub market: Pubkey,
     pub outcome: u8,
+    /// Scalar settlement fraction (0 for binary markets).
+    pub settlement_fraction: u32,
     pub resolved_at: i64,
+}
+
+#[event]
+pub struct ScalarProposed {
+    pub market: Pubkey,
+    pub resolver: Pubkey,
+    pub value: i64,
+    pub proposed_at: i64,
 }
 
 #[event]
@@ -1664,6 +1925,12 @@ pub enum ErrorCode {
     NothingToClaim,
     #[msg("Wrong resolver kind for this instruction")]
     WrongResolverKind,
+    #[msg("Wrong market kind for this instruction")]
+    WrongMarketKind,
+    #[msg("Unsupported market kind")]
+    UnsupportedMarketKind,
+    #[msg("Invalid scalar range (need lower_bound < upper_bound)")]
+    InvalidScalarRange,
     #[msg("Invalid oracle comparison code")]
     InvalidComparison,
     #[msg("Price feed has no published value yet")]

@@ -181,6 +181,58 @@ pub fn fee_amount(amount: u64, fee_bps: u16) -> Option<u64> {
     u64::try_from(f).ok()
 }
 
+/// Fixed-point scale for scalar-market settlement fractions: a fraction `f` in
+/// `[0, 1]` is represented as the integer `f * PRICE_SCALE`, so `PRICE_SCALE`
+/// means 1.0 and `PRICE_SCALE / 2` means 0.5. (Matches the 1e6 price scale used
+/// by [`marginal_price_micro`].)
+pub const PRICE_SCALE: u64 = 1_000_000;
+
+/// Map a scalar settlement `value` to a settlement fraction `f` in
+/// `[0, PRICE_SCALE]`, where `f = (clamp(value, lower, upper) - lower) /
+/// (upper - lower)`. LONG (=YES) tokens settle at `f`, SHORT (=NO) at `1 - f`.
+///
+/// `value` is clamped to `[lower, upper]` first, so out-of-range settlements map
+/// to the nearest bound (0 or PRICE_SCALE). Returns `None` unless `upper > lower`.
+/// All arithmetic uses i128/u128 intermediates so the full i64 bound range is safe
+/// (`upper - lower` can approach 2^64, which overflows i64 but not i128/u128).
+pub fn scalar_fraction(value: i64, lower: i64, upper: i64) -> Option<u32> {
+    if upper <= lower {
+        return None;
+    }
+    let lo = lower as i128;
+    let hi = upper as i128;
+    let v = (value as i128).clamp(lo, hi);
+    // Both differences are >= 0 and `hi - lo > 0` after the guard above.
+    let num = (v - lo) as u128;
+    let span = (hi - lo) as u128;
+    let f = num.checked_mul(PRICE_SCALE as u128)? / span;
+    // `num <= span` after clamping, so `f <= PRICE_SCALE` and fits in u32.
+    u32::try_from(f).ok()
+}
+
+/// Payout (in collateral base units) for `amount` outcome tokens of a scalar
+/// market that resolved to `fraction_micro` (a value in `[0, PRICE_SCALE]`).
+///
+/// LONG settles at the fraction, SHORT at its complement:
+/// * LONG  → `amount * fraction_micro / PRICE_SCALE`
+/// * SHORT → `amount * (PRICE_SCALE - fraction_micro) / PRICE_SCALE`
+///
+/// Rounds **down** (floor) so the vault is never overpaid. Because both sides
+/// floor, `long_payout + short_payout <= amount` for any single `amount` — the
+/// no-overpay / conservation property the unit tests assert. `fraction_micro` is
+/// assumed `<= PRICE_SCALE` (guaranteed by [`scalar_fraction`]); larger values
+/// saturate the complement to zero rather than underflowing.
+pub fn scalar_payout(amount: u64, fraction_micro: u32, is_long: bool) -> u64 {
+    let frac = if is_long {
+        fraction_micro as u128
+    } else {
+        (PRICE_SCALE as u128).saturating_sub(fraction_micro as u128)
+    };
+    let payout = (amount as u128) * frac / PRICE_SCALE as u128;
+    // payout <= amount <= u64::MAX, so this never truncates.
+    payout as u64
+}
+
 /// Oracle comparison: YES iff the feed value is `>=` the strike.
 pub const CMP_GTE: u8 = 0;
 /// Oracle comparison: YES iff the feed value is `<=` the strike.
@@ -304,6 +356,63 @@ mod tests {
     }
 
     #[test]
+    fn scalar_fraction_basic() {
+        // Range [200, 300] ($2.00–$3.00 in cents).
+        assert_eq!(scalar_fraction(200, 200, 300), Some(0)); // at lower
+        assert_eq!(scalar_fraction(300, 200, 300), Some(PRICE_SCALE as u32)); // at upper
+        assert_eq!(scalar_fraction(250, 200, 300), Some(500_000)); // midpoint
+        assert_eq!(scalar_fraction(290, 200, 300), Some(900_000)); // near upper
+        assert_eq!(scalar_fraction(210, 200, 300), Some(100_000)); // near lower
+
+        // Clamping: below lower -> 0, above upper -> PRICE_SCALE.
+        assert_eq!(scalar_fraction(199, 200, 300), Some(0));
+        assert_eq!(scalar_fraction(-50, 200, 300), Some(0));
+        assert_eq!(scalar_fraction(301, 200, 300), Some(PRICE_SCALE as u32));
+        assert_eq!(scalar_fraction(10_000, 200, 300), Some(PRICE_SCALE as u32));
+        // Negative bounds compare/clamp correctly.
+        assert_eq!(scalar_fraction(0, -100, 100), Some(500_000));
+        assert_eq!(scalar_fraction(-50, -100, 100), Some(250_000));
+        // Degenerate / inverted ranges rejected.
+        assert_eq!(scalar_fraction(5, 10, 10), None);
+        assert_eq!(scalar_fraction(5, 10, 0), None);
+    }
+
+    #[test]
+    fn scalar_fraction_no_overflow_at_extremes() {
+        // upper - lower approaches 2^64 (overflows i64, fine in i128/u128).
+        let f = scalar_fraction(0, i64::MIN, i64::MAX).unwrap();
+        assert!(f <= PRICE_SCALE as u32);
+        // Value at the upper extreme maps to PRICE_SCALE.
+        assert_eq!(
+            scalar_fraction(i64::MAX, i64::MIN, i64::MAX),
+            Some(PRICE_SCALE as u32)
+        );
+        assert_eq!(scalar_fraction(i64::MIN, i64::MIN, i64::MAX), Some(0));
+    }
+
+    #[test]
+    fn scalar_payout_basic() {
+        // f = 0: LONG gets nothing, SHORT gets everything.
+        assert_eq!(scalar_payout(1_000_000, 0, true), 0);
+        assert_eq!(scalar_payout(1_000_000, 0, false), 1_000_000);
+        // f = PRICE_SCALE: LONG gets everything, SHORT gets nothing.
+        assert_eq!(
+            scalar_payout(1_000_000, PRICE_SCALE as u32, true),
+            1_000_000
+        );
+        assert_eq!(scalar_payout(1_000_000, PRICE_SCALE as u32, false), 0);
+        // f = half: both get half.
+        assert_eq!(scalar_payout(1_000_000, 500_000, true), 500_000);
+        assert_eq!(scalar_payout(1_000_000, 500_000, false), 500_000);
+        // Floor rounding: an odd amount at half loses 1 base unit total.
+        assert_eq!(scalar_payout(1, 500_000, true), 0);
+        assert_eq!(scalar_payout(1, 500_000, false), 0);
+        // 90/10 split.
+        assert_eq!(scalar_payout(1_000_000, 900_000, true), 900_000);
+        assert_eq!(scalar_payout(1_000_000, 900_000, false), 100_000);
+    }
+
+    #[test]
     fn fee_math() {
         assert_eq!(fee_amount(1_000_000, 100).unwrap(), 10_000); // 1%
         assert_eq!(fee_amount(1_000_000, 0).unwrap(), 0);
@@ -388,6 +497,24 @@ mod tests {
                     prop_assert!(sell.tokens_in >= buy.tokens_out);
                 }
             }
+        }
+
+        // Scalar settlement never overpays the vault: for the SAME `amount`, a
+        // LONG payout plus a SHORT payout is at most `amount` (both floor), and
+        // each side is individually <= amount. `fraction` spans the full valid
+        // [0, PRICE_SCALE] range.
+        #[test]
+        fn prop_scalar_payout_no_overpay(
+            amount in 0u64..u64::MAX,
+            fraction in 0u32..=(PRICE_SCALE as u32),
+        ) {
+            let long = scalar_payout(amount, fraction, true);
+            let short = scalar_payout(amount, fraction, false);
+            prop_assert!(long <= amount);
+            prop_assert!(short <= amount);
+            // No-overpay / conservation: the two halves of one position never
+            // redeem for more than the collateral that backs it.
+            prop_assert!(long as u128 + short as u128 <= amount as u128);
         }
     }
 }

@@ -38,11 +38,14 @@ import {
   STATE_VOID,
   STATE_RESOLVING,
   RESOLVER_ORACLE_FEED,
+  MARKET_SCALAR,
+  PRICE_SCALE,
   CMP_GTE,
   quoteBuy,
   quoteSell,
   feeAmount,
   marginalPrice,
+  scalarPayout,
   deriveMarketAccounts,
 } from "../sdk/client";
 
@@ -497,6 +500,200 @@ describe("compute-markets", () => {
         await sendExpectFail([await client.publishPriceIx(user1.publicKey, feed.publicKey, new BN(1))], user1),
         /Unauthorized/
       );
+    });
+  });
+
+  describe("scalar / range markets", () => {
+    // Create + seed a SCALAR market over [lower, upper]. YES=LONG, NO=SHORT.
+    async function createScalarMarket(opts: {
+      lower: number;
+      upper: number;
+      seed?: BN;
+      resolutionOffset?: number;
+      resolver?: PublicKey;
+      resolverKind?: number;
+      oracleFeed?: PublicKey;
+      oracleMaxStaleness?: number;
+    }): Promise<number> {
+      const off = opts.resolutionOffset ?? 6;
+      const seed = opts.seed ?? USDC(1000);
+      const now = nowSec();
+      const { ix, marketId } = await client.createMarketIx(
+        admin.publicKey,
+        {
+          question: `Scalar #${Math.random()} [${opts.lower},${opts.upper}]`,
+          resolutionSource: "Silicon Data SDH100RT",
+          closeTime: new BN(now + off),
+          resolutionTime: new BN(now + off),
+          resolver: opts.resolver ?? admin.publicKey,
+          resolverKind: opts.resolverKind,
+          oracleFeed: opts.oracleFeed,
+          oracleComparison: CMP_GTE,
+          oracleMaxStaleness: opts.oracleMaxStaleness !== undefined ? new BN(opts.oracleMaxStaleness) : undefined,
+          marketKind: MARKET_SCALAR,
+          lowerBound: new BN(opts.lower),
+          upperBound: new BN(opts.upper),
+        },
+        usdcMint
+      );
+      await send([ix], admin);
+      await send([await client.seedLiquidityIx(admin.publicKey, marketId, seed, usdcMint)], admin);
+      return marketId;
+    }
+
+    it("create rejects an inverted scalar range", async () => {
+      const now = nowSec();
+      const bad = await client.createMarketIx(
+        admin.publicKey,
+        {
+          question: "bad range",
+          resolutionSource: "s",
+          closeTime: new BN(now + 30),
+          resolutionTime: new BN(now + 30),
+          resolver: admin.publicKey,
+          marketKind: MARKET_SCALAR,
+          lowerBound: new BN(300),
+          upperBound: new BN(200),
+        },
+        usdcMint
+      );
+      assert.match(await sendExpectFail([bad.ix], admin), /InvalidScalarRange/);
+    });
+
+    it("trusted midpoint settlement (250 in [200,300]) pays LONG and SHORT 0.5 each", async () => {
+      const marketId = await createScalarMarket({ lower: 200, upper: 300 });
+      const m0 = await client.fetchMarketById(marketId);
+      assert.strictEqual(m0.marketKind, MARKET_SCALAR);
+      assert.strictEqual(m0.lowerBound.toString(), "200");
+      assert.strictEqual(m0.upperBound.toString(), "300");
+
+      // user1 buys LONG (YES), user2 buys SHORT (NO).
+      const longTokens = await buy(user1, marketId, OUTCOME_YES, USDC(200));
+      const shortTokens = await buy(user2, marketId, OUTCOME_NO, USDC(200));
+      await assertConservation(marketId, "scalar-seed-buy");
+
+      // propose_outcome (binary) must be rejected on a scalar market.
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+      assert.match(
+        await sendExpectFail([await client.proposeOutcomeIx(admin.publicKey, marketId, OUTCOME_YES)], admin),
+        /WrongMarketKind/
+      );
+
+      // Propose the midpoint and finalize after the dispute window.
+      await send([await client.proposeScalarIx(admin.publicKey, marketId, new BN(250))], admin);
+      const proposing = await client.fetchMarketById(marketId);
+      assert.strictEqual(proposing.state, STATE_RESOLVING);
+      assert.strictEqual(proposing.proposedValue.toString(), "250");
+
+      await waitChainTime(proposing.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeOutcomeIx(user2.publicKey, marketId)], user2);
+      const fin = await client.fetchMarketById(marketId);
+      assert.strictEqual(fin.state, STATE_RESOLVED);
+      assert.strictEqual(fin.settlementFraction, 500000, "midpoint => f=0.5");
+
+      // binary redeem must be rejected on a scalar market.
+      assert.match(
+        await sendExpectFail([await client.redeemIx(user1.publicKey, marketId, OUTCOME_YES, new BN(1), usdcMint)], user1),
+        /WrongMarketKind/
+      );
+
+      // LONG holder redeems for amount*0.5; SHORT holder for amount*0.5.
+      const u1usdc = getAssociatedTokenAddressSync(usdcMint, user1.publicKey);
+      const u2usdc = getAssociatedTokenAddressSync(usdcMint, user2.publicKey);
+      const u1Before = await tokenBalance(u1usdc);
+      const u2Before = await tokenBalance(u2usdc);
+
+      await send([await client.redeemScalarIx(user1.publicKey, marketId, OUTCOME_YES, longTokens, usdcMint)], user1);
+      await send([await client.redeemScalarIx(user2.publicKey, marketId, OUTCOME_NO, shortTokens, usdcMint)], user2);
+
+      const expLong = scalarPayout(longTokens, new BN(500000), true);
+      const expShort = scalarPayout(shortTokens, new BN(500000), false);
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.add(expLong).toString(), "LONG payout");
+      assert.strictEqual((await tokenBalance(u2usdc)).toString(), u2Before.add(expShort).toString(), "SHORT payout");
+      await assertConservation(marketId, "scalar-redeem");
+
+      // LP claims the pooled reserves at the settled fraction; vault conserves.
+      await send([await client.claimPoolIx(admin.publicKey, marketId, usdcMint)], admin);
+      await assertConservation(marketId, "scalar-claim");
+      const after = await client.fetchMarketById(marketId);
+      assert.isTrue(after.collateral.lten(4), `residual dust too large: ${after.collateral}`);
+    });
+
+    it("asymmetric settlement near the upper bound (290 => f=0.9)", async () => {
+      const marketId = await createScalarMarket({ lower: 200, upper: 300 });
+      const longTokens = await buy(user1, marketId, OUTCOME_YES, USDC(150));
+      const shortTokens = await buy(user2, marketId, OUTCOME_NO, USDC(150));
+
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+      await send([await client.proposeScalarIx(admin.publicKey, marketId, new BN(290))], admin);
+      const proposing = await client.fetchMarketById(marketId);
+      await waitChainTime(proposing.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeOutcomeIx(user1.publicKey, marketId)], user1);
+      const fin = await client.fetchMarketById(marketId);
+      assert.strictEqual(fin.settlementFraction, 900000, "290 in [200,300] => f=0.9");
+
+      const u1usdc = getAssociatedTokenAddressSync(usdcMint, user1.publicKey);
+      const u2usdc = getAssociatedTokenAddressSync(usdcMint, user2.publicKey);
+      const u1Before = await tokenBalance(u1usdc);
+      const u2Before = await tokenBalance(u2usdc);
+      await send([await client.redeemScalarIx(user1.publicKey, marketId, OUTCOME_YES, longTokens, usdcMint)], user1);
+      await send([await client.redeemScalarIx(user2.publicKey, marketId, OUTCOME_NO, shortTokens, usdcMint)], user2);
+
+      const expLong = scalarPayout(longTokens, new BN(900000), true); // 0.9 * tokens
+      const expShort = scalarPayout(shortTokens, new BN(900000), false); // 0.1 * tokens
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.add(expLong).toString(), "LONG gets ~0.9");
+      assert.strictEqual((await tokenBalance(u2usdc)).toString(), u2Before.add(expShort).toString(), "SHORT gets ~0.1");
+      assert.isTrue(expLong.gt(expShort), "LONG payout exceeds SHORT near upper bound");
+      await assertConservation(marketId, "scalar-asym-redeem");
+    });
+
+    it("clamps a settlement above the upper bound to f=PRICE_SCALE", async () => {
+      const marketId = await createScalarMarket({ lower: 200, upper: 300 });
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+      await send([await client.proposeScalarIx(admin.publicKey, marketId, new BN(500))], admin); // above upper
+      const proposing = await client.fetchMarketById(marketId);
+      await waitChainTime(proposing.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeOutcomeIx(user1.publicKey, marketId)], user1);
+      const fin = await client.fetchMarketById(marketId);
+      assert.strictEqual(fin.settlementFraction, PRICE_SCALE, "value above upper clamps to PRICE_SCALE");
+    });
+
+    it("oracle-resolved scalar market maps the feed value through the bounds", async () => {
+      // Publish a feed value of 270; range [200,300] => f = 0.7.
+      const feed = Keypair.generate();
+      await send([await client.initPriceFeedIx(admin.publicKey, feed.publicKey, "Silicon Data SDH100RT", 2)], admin, [feed]);
+      await send([await client.publishPriceIx(admin.publicKey, feed.publicKey, new BN(270))], admin);
+
+      const marketId = await createScalarMarket({
+        lower: 200,
+        upper: 300,
+        resolverKind: RESOLVER_ORACLE_FEED,
+        oracleFeed: feed.publicKey,
+        oracleMaxStaleness: 3600,
+      });
+      const longTokens = await buy(user1, marketId, OUTCOME_YES, USDC(100));
+
+      const m0 = await client.fetchMarketById(marketId);
+      await waitChainTime(m0.resolutionTime.toNumber() + 1);
+      await send([await client.proposeFromOracleIx(user2.publicKey, marketId, feed.publicKey)], user2);
+      const proposing = await client.fetchMarketById(marketId);
+      assert.strictEqual(proposing.state, STATE_RESOLVING);
+      assert.strictEqual(proposing.proposedValue.toString(), "270", "scalar oracle stores raw feed value");
+
+      await waitChainTime(proposing.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      await send([await client.finalizeOutcomeIx(user2.publicKey, marketId)], user2);
+      const fin = await client.fetchMarketById(marketId);
+      assert.strictEqual(fin.state, STATE_RESOLVED);
+      assert.strictEqual(fin.settlementFraction, 700000, "270 in [200,300] => f=0.7");
+
+      const u1usdc = getAssociatedTokenAddressSync(usdcMint, user1.publicKey);
+      const u1Before = await tokenBalance(u1usdc);
+      await send([await client.redeemScalarIx(user1.publicKey, marketId, OUTCOME_YES, longTokens, usdcMint)], user1);
+      const expLong = scalarPayout(longTokens, new BN(700000), true);
+      assert.strictEqual((await tokenBalance(u1usdc)).toString(), u1Before.add(expLong).toString(), "LONG gets 0.7");
+      await assertConservation(marketId, "scalar-oracle-redeem");
     });
   });
 });

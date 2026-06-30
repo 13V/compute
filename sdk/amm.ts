@@ -79,3 +79,29 @@ export function maxInWithSlippage(tokensIn: BN, slippage: number): BN {
   const bps = Math.floor((1 + slippage) * 10_000);
   return tokensIn.muln(bps).divn(10_000);
 }
+
+/** Fixed-point scale for scalar settlement fractions (mirrors `PRICE_SCALE`). */
+const PRICE_SCALE_BN = new BN(1_000_000);
+
+/**
+ * Client-side mirror of the program's `scalar_fraction`: maps a settlement
+ * `value` to a fraction in `[0, PRICE_SCALE]` over the range `[lower, upper]`.
+ * `value` is clamped to the range; returns `null` unless `upper > lower`.
+ */
+export function scalarFraction(value: BN, lower: BN, upper: BN): BN | null {
+  if (upper.lte(lower)) return null;
+  let v = value;
+  if (v.lt(lower)) v = lower;
+  if (v.gt(upper)) v = upper;
+  return v.sub(lower).mul(PRICE_SCALE_BN).div(upper.sub(lower));
+}
+
+/**
+ * Client-side mirror of the program's `scalar_payout`: payout for `amount`
+ * tokens given a settlement `fractionMicro` in `[0, PRICE_SCALE]`. LONG settles
+ * at the fraction, SHORT at its complement; floor-rounded (never overpays).
+ */
+export function scalarPayout(amount: BN, fractionMicro: BN, isLong: boolean): BN {
+  const frac = isLong ? fractionMicro : PRICE_SCALE_BN.sub(fractionMicro);
+  return amount.mul(frac).div(PRICE_SCALE_BN);
+}

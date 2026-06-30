@@ -505,6 +505,18 @@ export type ComputeMarkets = {
         {
           "name": "oracleMaxStaleness",
           "type": "i64"
+        },
+        {
+          "name": "marketKind",
+          "type": "u8"
+        },
+        {
+          "name": "lowerBound",
+          "type": "i64"
+        },
+        {
+          "name": "upperBound",
+          "type": "i64"
         }
       ]
     },
@@ -859,6 +871,61 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "proposeScalar",
+      "docs": [
+        "Step 1 of resolution for a SCALAR market: the market's `resolver` proposes",
+        "a settlement `value` at/after `resolution_time`. Mirrors `propose_outcome`",
+        "but records a raw scalar value (mapped to a fraction at finalize) instead",
+        "of a YES/NO outcome. Opens the same dispute window; payouts stay locked."
+      ],
+      "discriminator": [
+        212,
+        107,
+        139,
+        60,
+        135,
+        242,
+        216,
+        0
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "resolver",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "value",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "publishPrice",
       "docs": [
         "Post a new value to a price feed (feed authority only). `value` is in the",
@@ -905,6 +972,83 @@ export type ComputeMarkets = {
         196,
         97,
         225
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.market_id",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "winningMint",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "userOutcome",
+          "writable": true
+        },
+        {
+          "name": "userCollateral",
+          "writable": true
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "redeemScalar",
+      "docs": [
+        "Redeem `amount` of a SCALAR market's LONG (yes_mint) or SHORT (no_mint)",
+        "token for its settled value. `is_long` is inferred from which of the two",
+        "mints the user's outcome ATA holds; the payout is",
+        "`scalar_payout(amount, settlement_fraction, is_long)` (floor-rounded so the",
+        "vault is never overpaid)."
+      ],
+      "discriminator": [
+        33,
+        153,
+        69,
+        243,
+        222,
+        230,
+        110,
+        41
       ],
       "accounts": [
         {
@@ -1722,6 +1866,19 @@ export type ComputeMarkets = {
       ]
     },
     {
+      "name": "scalarProposed",
+      "discriminator": [
+        33,
+        173,
+        142,
+        204,
+        39,
+        191,
+        148,
+        142
+      ]
+    },
+    {
       "name": "tradeExecuted",
       "discriminator": [
         41,
@@ -1868,21 +2025,36 @@ export type ComputeMarkets = {
     },
     {
       "code": 6026,
+      "name": "wrongMarketKind",
+      "msg": "Wrong market kind for this instruction"
+    },
+    {
+      "code": 6027,
+      "name": "unsupportedMarketKind",
+      "msg": "Unsupported market kind"
+    },
+    {
+      "code": 6028,
+      "name": "invalidScalarRange",
+      "msg": "Invalid scalar range (need lower_bound < upper_bound)"
+    },
+    {
+      "code": 6029,
       "name": "invalidComparison",
       "msg": "Invalid oracle comparison code"
     },
     {
-      "code": 6027,
+      "code": 6030,
       "name": "feedHasNoValue",
       "msg": "Price feed has no published value yet"
     },
     {
-      "code": 6028,
+      "code": 6031,
       "name": "staleFeed",
       "msg": "Price feed value is too stale to resolve"
     },
     {
-      "code": 6029,
+      "code": 6032,
       "name": "mathOverflow",
       "msg": "Arithmetic overflow"
     }
@@ -1984,6 +2156,43 @@ export type ComputeMarkets = {
           {
             "name": "resolverKind",
             "type": "u8"
+          },
+          {
+            "name": "marketKind",
+            "docs": [
+              "`MARKET_BINARY` or `MARKET_SCALAR`. Scalar markets reuse the binary FPMM",
+              "(YES=LONG, NO=SHORT) and differ only in resolution + redemption."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "lowerBound",
+            "docs": [
+              "Scalar range `[lower_bound, upper_bound]` (used when `market_kind ==",
+              "MARKET_SCALAR`; both 0 for binary). Settlement clamps the resolved value",
+              "to this range and maps it to a fraction in `[0, PRICE_SCALE]`."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "upperBound",
+            "type": "i64"
+          },
+          {
+            "name": "proposedValue",
+            "docs": [
+              "Proposed scalar settlement value (parallels `proposed_outcome`). Set by",
+              "`propose_scalar` / `propose_from_oracle` for scalar markets."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "settlementFraction",
+            "docs": [
+              "Resolved settlement fraction `f` scaled to `PRICE_SCALE`, in",
+              "`[0, PRICE_SCALE]`. Set at `finalize_outcome` for scalar markets."
+            ],
+            "type": "u32"
           },
           {
             "name": "oracleFeed",
@@ -2150,6 +2359,13 @@ export type ComputeMarkets = {
           {
             "name": "outcome",
             "type": "u8"
+          },
+          {
+            "name": "settlementFraction",
+            "docs": [
+              "Scalar settlement fraction (0 for binary markets)."
+            ],
+            "type": "u32"
           },
           {
             "name": "resolvedAt",
@@ -2319,6 +2535,30 @@ export type ComputeMarkets = {
           {
             "name": "payout",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "scalarProposed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "resolver",
+            "type": "pubkey"
+          },
+          {
+            "name": "value",
+            "type": "i64"
+          },
+          {
+            "name": "proposedAt",
+            "type": "i64"
           }
         ]
       }

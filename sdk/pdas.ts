@@ -21,6 +21,13 @@ export const STATE_VOID = 3;
 export const RESOLVER_TRUSTED_KEY = 0;
 export const RESOLVER_ORACLE_FEED = 1;
 
+/** Market kinds: binary YES/NO vs scalar/range (YES=LONG, NO=SHORT). */
+export const MARKET_BINARY = 0;
+export const MARKET_SCALAR = 1;
+
+/** Fixed-point scale for scalar settlement fractions (1e6 => 1.0). */
+export const PRICE_SCALE = 1_000_000;
+
 /** Oracle comparison codes: YES iff value >= strike (GTE) / value <= strike (LTE). */
 export const CMP_GTE = 0;
 export const CMP_LTE = 1;
