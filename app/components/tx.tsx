@@ -14,6 +14,7 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Transaction, TransactionInstruction } from "@solana/web3.js";
 import { RPC_URL } from "./WalletProviders";
 import { explorerTxUrl } from "../lib/format";
+import { computeBudgetIxs } from "./priorityFee";
 
 export type TxStatus = "building" | "signing" | "confirming" | "success" | "error";
 
@@ -129,9 +130,11 @@ export function useTxRunner(): (opts: RunOpts) => Promise<string | null> {
           throw new Error("Connect a wallet first.");
         }
         const ixs = await opts.build();
+        // Prepend priority fee + compute-unit budget for reliability under load.
+        const budget = await computeBudgetIxs(connection, wallet.publicKey, ixs);
         update(id, { status: "signing" });
 
-        const tx = new Transaction().add(...ixs);
+        const tx = new Transaction().add(...budget, ...ixs);
         tx.feePayer = wallet.publicKey;
         const { blockhash, lastValidBlockHeight } =
           await connection.getLatestBlockhash("confirmed");

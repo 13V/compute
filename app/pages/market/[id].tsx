@@ -20,6 +20,7 @@ import { RPC_URL } from "../../components/WalletProviders";
 import { useComputeClient, useReadClient } from "../../components/useComputeClient";
 import { useNow, marketStateLabel, StateBadge, CopyKey } from "../../components/ui";
 import { useToasts } from "../../components/tx";
+import { computeBudgetIxs } from "../../components/priorityFee";
 import PriceChart from "../../components/PriceChart";
 import { fetchPriceHistory, type PricePoint } from "../../components/history";
 import type {
@@ -313,7 +314,9 @@ export default function MarketPage() {
       if (!wallet.publicKey || !wallet.sendTransaction) {
         throw new Error("Wallet not connected");
       }
-      const tx = new Transaction().add(...ixs);
+      // Prepend priority fee + compute-unit budget for reliability under load.
+      const budget = await computeBudgetIxs(connection, wallet.publicKey, ixs);
+      const tx = new Transaction().add(...budget, ...ixs);
       tx.feePayer = wallet.publicKey;
       const { blockhash, lastValidBlockHeight } =
         await connection.getLatestBlockhash("confirmed");
