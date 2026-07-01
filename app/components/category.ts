@@ -21,7 +21,7 @@ export const CATEGORIES: Category[] = [
 
 const MATCHERS: { key: CategoryKey; re: RegExp }[] = [
   // Cloud spot / inference cost first (more specific than the bare GPU names).
-  { key: "cloud", re: /\b(aws|p5|gcp|a3|azure|spot|inference|\$\/m|per[- ]token|token)\b/i },
+  { key: "cloud", re: /\b(aws|p5|gcp|a3|azure|spot|inference|\$\/m|per[- ]token)\b/i },
   { key: "hardware", re: /\b(nvidia|tsmc|cowos|hbm|wafer|blackwell|rubin|power|datacenter|data center|grid|gw|capex|fab|supply)\b/i },
   { key: "ai", re: /\b(model|frontier|gpt|lmarena|elo|swe-?bench|benchmark|open-?weights|agi|reasoning|capability)\b/i },
   { key: "gpu", re: /\b(h100|h200|b200|gb200|a100|mi300|gpu|neocloud|\$\/hr|per[- ]hour|rental)\b/i },

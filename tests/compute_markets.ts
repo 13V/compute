@@ -1307,6 +1307,56 @@ describe("compute-markets", () => {
       await send([await client.finalizeAssertionIx(user1.publicKey, late, usdcMint)], user1);
       assert.strictEqual((await client.fetchMarketById(late)).state, STATE_RESOLVED);
 
+      // (h) REGRESSION: the generic permissionless `finalize_outcome` must REJECT
+      // optimistic markets. Otherwise, once the dispute window elapses, anyone
+      // could crank a DISPUTED assertion to the asserter's claimed outcome —
+      // bypassing the guardian's `resolve_dispute` and stranding the bond escrow.
+      const optFin = await createOptimisticMarket({ resolutionOffset: 4, closeOffset: 4 });
+      const ofm = await client.fetchMarketById(optFin);
+      await waitChainTime(ofm.resolutionTime.toNumber() + 1);
+      await send(await client.assertOutcomeIxs(user1.publicKey, optFin, OUTCOME_YES, usdcMint), user1);
+      await send([await client.disputeAssertionIx(user2.publicKey, optFin, usdcMint)], user2);
+      const ofa = await client.fetchMarketById(optFin);
+      await waitChainTime(ofa.resolvedAt.toNumber() + DISPUTE_PERIOD + 1);
+      assert.match(
+        await sendExpectFail([await client.finalizeOutcomeIx(user1.publicKey, optFin)], user1),
+        /WrongResolverKind/
+      );
+      // The disputed market still settles correctly via the guardian path.
+      await send(
+        [await client.resolveDisputeIx(guardian.publicKey, optFin, OUTCOME_NO, user2.publicKey, usdcMint)],
+        guardian
+      );
+      assert.strictEqual((await client.fetchMarketById(optFin)).state, STATE_RESOLVED);
+
+      // (i) REGRESSION: a SCALAR + OPTIMISTIC market is rejected at creation
+      // (optimistic resolution is BINARY-only).
+      assert.match(
+        await sendExpectFail(
+          [
+            (
+              await client.createMarketIx(
+                admin.publicKey,
+                {
+                  question: "scalar+optimistic should fail",
+                  resolutionSource: "x",
+                  closeTime: new BN(nowSec() + 30),
+                  resolutionTime: new BN(nowSec() + 30),
+                  resolver: admin.publicKey,
+                  resolverKind: RESOLVER_OPTIMISTIC,
+                  marketKind: MARKET_SCALAR,
+                  lowerBound: new BN(100),
+                  upperBound: new BN(200),
+                },
+                usdcMint
+              )
+            ).ix,
+          ],
+          admin
+        ),
+        /WrongMarketKind/
+      );
+
       // void_stale still works on an un-asserted optimistic market (state OPEN).
       const stale = await createOptimisticMarket({ resolutionOffset: 4, closeOffset: 4 });
       assert.strictEqual((await client.fetchMarketById(stale)).state, STATE_OPEN);

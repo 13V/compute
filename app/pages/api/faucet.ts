@@ -18,11 +18,28 @@ import { ComputeClient } from "../../lib/client";
 import { clusterFromRpc } from "../../lib/format";
 
 const RPC = process.env.NEXT_PUBLIC_RPC_URL || "http://127.0.0.1:8899";
-const AMOUNT = Number(process.env.FAUCET_AMOUNT || "25000");
+// Validate FAUCET_AMOUNT so a non-numeric env can't produce BigInt(NaN).
+const AMOUNT = (() => {
+  const n = Number(process.env.FAUCET_AMOUNT || "25000");
+  return Number.isFinite(n) && n > 0 && n <= 1_000_000 ? n : 25000;
+})();
 const COOLDOWN_MS = 60_000;
+// Global daily cap so unlimited fresh keypairs can't drain the authority's SOL
+// (each novel owner costs ~rent to create an ATA) or mint unbounded test tokens.
+const DAILY_CAP = (() => {
+  const n = Number(process.env.FAUCET_DAILY_CAP || "500");
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 500;
+})();
 
-// In-memory per-owner cooldown (best-effort; resets on redeploy).
+// Best-effort in-memory limiters (reset on redeploy; per-instance on serverless).
 const lastDrip: Record<string, number> = {};
+let dayKey = "";
+let dayCount = 0;
+
+function clientIp(req: NextApiRequest): string {
+  const xff = (req.headers["x-forwarded-for"] as string) || "";
+  return xff.split(",")[0].trim() || req.socket?.remoteAddress || "unknown";
+}
 
 function loadAuthority(): Keypair | null {
   const raw = process.env.FAUCET_SECRET_KEY;
@@ -56,11 +73,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(400).json({ error: "invalid owner pubkey" });
   }
 
-  const key = owner.toBase58();
   const now = Date.now();
-  if (lastDrip[key] && now - lastDrip[key] < COOLDOWN_MS) {
-    const wait = Math.ceil((COOLDOWN_MS - (now - lastDrip[key])) / 1000);
-    return res.status(429).json({ error: `try again in ${wait}s` });
+  // Reset the global daily counter at each UTC day boundary.
+  const today = new Date(now).toISOString().slice(0, 10);
+  if (today !== dayKey) {
+    dayKey = today;
+    dayCount = 0;
+  }
+  if (dayCount >= DAILY_CAP) {
+    return res.status(429).json({ error: "faucet daily limit reached — try later" });
+  }
+
+  // Cooldown by BOTH owner and client IP so fresh keypairs can't bypass it.
+  const ip = clientIp(req);
+  for (const key of [`o:${owner.toBase58()}`, `i:${ip}`]) {
+    if (lastDrip[key] && now - lastDrip[key] < COOLDOWN_MS) {
+      const wait = Math.ceil((COOLDOWN_MS - (now - lastDrip[key])) / 1000);
+      return res.status(429).json({ error: `try again in ${wait}s` });
+    }
   }
 
   try {
@@ -90,9 +120,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       authority,
       BigInt(Math.round(AMOUNT * 1_000_000))
     );
-    lastDrip[key] = now;
+    lastDrip[`o:${owner.toBase58()}`] = now;
+    lastDrip[`i:${ip}`] = now;
+    dayCount += 1;
     return res.status(200).json({ signature: sig, amount: AMOUNT, mint: mint.toBase58() });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? "faucet failed" });
+    // Log detail server-side; return a generic message (no internal disclosure).
+    console.error("faucet error:", e?.message ?? e);
+    return res.status(500).json({ error: "faucet failed — try again later" });
   }
 }

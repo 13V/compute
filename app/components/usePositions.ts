@@ -123,6 +123,9 @@ function basisFor(fills: Fill[], marketKey: string): BN | null {
   let found = false;
   for (const f of fills) {
     if (f.market !== marketKey) continue;
+    // Only accept a plain non-negative integer string; `new BN("12.5")` does not
+    // throw in bn.js and would yield a garbage basis, so reject non-integers.
+    if (typeof f.cost !== "string" || !/^\d+$/.test(f.cost)) continue;
     let c: BN;
     try {
       c = new BN(f.cost);

@@ -213,6 +213,10 @@ pub mod compute_markets {
                 );
             }
             RESOLVER_OPTIMISTIC => {
+                // Optimistic resolution only supports BINARY markets — `assert_outcome`
+                // posts a YES/NO claim. Reject SCALAR+OPTIMISTIC at creation rather than
+                // letting it be created and then only resolvable via the 50/50 void path.
+                require!(market_kind == MARKET_BINARY, ErrorCode::WrongMarketKind);
                 // No oracle/strike/resolver validation: the asserter is permissionless
                 // and posts a bond at `assert_outcome` time. `resolver` may be default.
             }
@@ -1394,6 +1398,15 @@ pub mod compute_markets {
     pub fn finalize_outcome(ctx: Context<FinalizeOutcome>) -> Result<()> {
         let dispute_period = ctx.accounts.config.dispute_period;
         let market = &mut ctx.accounts.market;
+        // Optimistic markets settle EXCLUSIVELY via `finalize_assertion` (undisputed)
+        // or `resolve_dispute` (guardian-arbitrated). Excluding them here prevents a
+        // permissionless `finalize_outcome` crank from (a) finalizing a DISPUTED
+        // assertion to the asserter's claim without guardian review, and (b) stranding
+        // the bond escrow (which only the optimistic finalizers can release).
+        require!(
+            market.resolver_kind != RESOLVER_OPTIMISTIC,
+            ErrorCode::WrongResolverKind
+        );
         require!(market.state == STATE_RESOLVING, ErrorCode::NotProposed);
         let now = Clock::get()?.unix_timestamp;
         require!(

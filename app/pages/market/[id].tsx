@@ -87,6 +87,43 @@ function fmtNum(n: number): string {
   return Number.isFinite(n) ? parseFloat(n.toFixed(2)).toString() : "—";
 }
 
+/**
+ * num/den as a JS float, safe for large BN inputs. Scales to 1e6 fixed-point via
+ * BN division FIRST (result is bounded), so `.toNumber()` never exceeds 2^53 even
+ * when num/den are huge (avoids the bn.js 53-bit assert crash on big inputs).
+ */
+function safeRatio(num: BN, den: BN): number {
+  if (den.isZero()) return 0;
+  return num.mul(new BN(1_000_000)).div(den).toNumber() / 1_000_000;
+}
+
+/**
+ * Record a buy fill to the local cost-basis ledger so the portfolio can show
+ * P&L on positions opened through this UI. Best-effort (localStorage may be
+ * unavailable); bounded to the most recent 500 fills.
+ */
+function recordFill(marketPk: string, side: number, cost: BN, tokens: BN) {
+  try {
+    if (typeof window === "undefined") return;
+    const raw = window.localStorage.getItem("compute:fills");
+    const arr = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(arr)) return;
+    arr.push({
+      market: marketPk,
+      side,
+      cost: cost.toString(),
+      tokens: tokens.toString(),
+      ts: Math.floor(Date.now() / 1000),
+    });
+    window.localStorage.setItem(
+      "compute:fills",
+      JSON.stringify(arr.slice(-500))
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Parse a signed integer string (scalar bounds/values are i64, no decimals). */
 function parseIntBN(input: string): BN | null {
   const s = input.trim();
@@ -250,10 +287,14 @@ export default function MarketPage() {
           )) as unknown as MarketAccount;
           setMarket(m);
           const yesPrice = marginalPrice(m.reserveYes, m.reserveNo);
-          setHistory((h) => [
-            ...h,
-            { time: Math.floor(Date.now() / 1000), price: Math.min(0.999, Math.max(0.001, yesPrice)) },
-          ]);
+          setHistory((h) => {
+            const next = [
+              ...h,
+              { time: Math.floor(Date.now() / 1000), price: Math.min(0.999, Math.max(0.001, yesPrice)) },
+            ];
+            // Cap the series so a long-open page doesn't grow unbounded.
+            return next.length > 500 ? next.slice(-500) : next;
+          });
         } catch {
           /* ignore transient decode errors */
         }
@@ -312,10 +353,12 @@ export default function MarketPage() {
             .catch(() => {});
         }
         await refreshAll();
+        return sig;
       } catch (e: any) {
         const msg = client ? client.parseError(e) : readClient.parseError(e);
         update(id, { status: "error", message: msg });
         setTxError(msg);
+        return null;
       } finally {
         setBusy(false);
       }
@@ -649,16 +692,27 @@ export default function MarketPage() {
             canTrade={!!client && !!wallet.publicKey && tradingEnabled}
             tradingClosed={tradingClosed}
             onBuy={(side, collateralIn, minTokensOut) =>
-              runAction(() =>
-                client!.buyIxs(
-                  wallet.publicKey!,
-                  market.marketId,
-                  side,
-                  collateralIn,
-                  minTokensOut,
-                  market.collateralMint
-                )
-              )
+              runAction(
+                () =>
+                  client!.buyIxs(
+                    wallet.publicKey!,
+                    market.marketId,
+                    side,
+                    collateralIn,
+                    minTokensOut,
+                    market.collateralMint
+                  ),
+                `Buy ${outcomeLabel(side, scalar)} · Market #${market.marketId.toString()}`
+              ).then((sig) => {
+                if (sig && marketPubkey) {
+                  recordFill(
+                    marketPubkey.toBase58(),
+                    side,
+                    collateralIn,
+                    minTokensOut
+                  );
+                }
+              })
             }
           />
           <SellPanel
@@ -1158,11 +1212,9 @@ function BuyPanel({
           <div className="kv">
             <span className="k">Avg price</span>
             <span>
-              {(() => {
-                const i = parsed ? parsed.toNumber() : 0;
-                const o = preview.tokensOut.toNumber();
-                return o > 0 ? formatPct(i / o) : "—";
-              })()}
+              {parsed && preview.tokensOut.gtn(0)
+                ? formatPct(safeRatio(parsed, preview.tokensOut))
+                : "—"}
             </span>
           </div>
           <div className="kv">
@@ -1180,11 +1232,9 @@ function BuyPanel({
               </div>
             </div>
             <div className="payout-mult">
-              {(() => {
-                const i = parsed ? parsed.toNumber() : 0;
-                const o = preview.tokensOut.toNumber();
-                return i > 0 ? `${(o / i).toFixed(2)}×` : "—";
-              })()}
+              {parsed && parsed.gtn(0)
+                ? `${safeRatio(preview.tokensOut, parsed).toFixed(2)}×`
+                : "—"}
             </div>
           </div>
         </div>
